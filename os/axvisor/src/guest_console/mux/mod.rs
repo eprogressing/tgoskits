@@ -66,7 +66,7 @@ struct ConsoleCore {
     output_lock: Mutex<()>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ConsoleState {
     guests: BTreeMap<VMId, GuestState>,
     running: BTreeSet<VMId>,
@@ -75,6 +75,22 @@ struct ConsoleState {
     shortcut_prefix_pending: bool,
     output: GuestOutputMux,
     next_backend_generation: u64,
+}
+
+impl Default for ConsoleState {
+    fn default() -> Self {
+        let mut output = GuestOutputMux::default();
+        output.buffer_all();
+        Self {
+            guests: BTreeMap::new(),
+            running: BTreeSet::new(),
+            attached: None,
+            last_attached: None,
+            shortcut_prefix_pending: false,
+            output,
+            next_backend_generation: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,6 +203,7 @@ impl GuestConsoleMux {
         detached
     }
 
+    #[cfg(test)]
     fn attach_default(&self, running: impl IntoIterator<Item = VMId>) -> Option<VMId> {
         self.set_running(running);
         let _output_guard = self.core.lock_output();
@@ -223,10 +240,10 @@ impl GuestConsoleMux {
         let _output_guard = self.core.lock_output();
         let mut state = self.core.lock_state();
         (state.attached == Some(vm_id)).then_some(())?;
-        let replay = state.output.select_foreground(vm_id);
+        let host_output = state.output.select_foreground(vm_id);
         drop(state);
-        write_host_bytes(&replay);
-        Some(replay)
+        write_host_bytes(&host_output);
+        Some(host_output)
     }
 
     fn route_host_byte(&self, byte: u8) -> RoutedInput {
@@ -408,11 +425,11 @@ impl ConsoleCore {
         bytes: &[u8],
     ) -> Option<Vec<u8>> {
         let mut state = self.lock_state();
-        let multiple_running = state.running.len() > 1;
         state
             .guests
             .get(&vm_id)
             .filter(|guest| guest.backend_generation == Some(generation))?;
+        let multiple_running = state.running.len() > 1;
         Some(state.output.format(vm_id, multiple_running, bytes))
     }
 
@@ -469,11 +486,6 @@ pub fn route_host_byte(byte: u8) -> ConsoleInputEvent {
         warn!("failed to wake VM[{vm_id}] for console input: {error:#}");
     }
     routed.event
-}
-
-/// Attach the lowest-ID member of the default running VM set.
-pub fn attach_default(running: impl IntoIterator<Item = VMId>) -> Option<VMId> {
-    GUEST_CONSOLE_MUX.attach_default(running)
 }
 
 /// Attach one running VM to the host console.

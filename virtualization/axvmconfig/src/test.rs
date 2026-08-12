@@ -74,6 +74,19 @@ fn parses_structured_guest_config() {
 }
 
 #[test]
+fn rejects_removed_show_boot_log_field() {
+    let error = GuestConfig::from_toml(
+        r#"
+[base]
+show_boot_log = false
+"#,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("unknown field `show_boot_log`"));
+}
+
+#[test]
 fn parses_open_virtual_device_options() {
     let config = GuestConfig::from_toml(
         r#"
@@ -281,6 +294,7 @@ fn menuconfig_schema_exposes_only_structured_device_selectors() {
         .and_then(|value| value.as_object())
         .unwrap();
     assert!(base_properties.contains_key("guest_type"));
+    assert!(!base_properties.contains_key("show_boot_log"));
     assert!(!base_properties.contains_key("vm_type"));
 
     let root_properties = schema

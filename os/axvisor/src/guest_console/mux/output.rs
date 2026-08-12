@@ -8,7 +8,7 @@ use alloc::{
     vec::Vec,
 };
 
-pub(super) const PER_GUEST_LOG_CAPACITY: usize = 16 * 1024;
+pub(super) const PER_GUEST_LOG_CAPACITY: usize = 2 * 1024 * 1024;
 
 /// Arbitrates complete host-console lines across guest serial backends.
 #[derive(Debug, Default)]
@@ -21,18 +21,22 @@ pub(crate) struct GuestOutputMux {
     total_pending: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutputMode {
-    #[default]
     BootMultiplex,
-    Interactive {
-        foreground: Option<usize>,
-    },
+    Interactive { foreground: Option<usize> },
+}
+
+impl Default for OutputMode {
+    fn default() -> Self {
+        Self::BootMultiplex
+    }
 }
 
 #[derive(Debug)]
 struct GuestOutputState {
     pending: VecDeque<u8>,
+    replayed: usize,
     at_line_start: bool,
 }
 
@@ -51,13 +55,21 @@ impl Default for GuestOutputState {
     fn default() -> Self {
         Self {
             pending: VecDeque::new(),
+            replayed: 0,
             at_line_start: true,
         }
     }
 }
 
+impl GuestOutputState {
+    fn unseen_len(&self) -> usize {
+        self.pending.len() - self.replayed
+    }
+}
+
 impl GuestOutputMux {
-    /// Starts the boot-time mode that displays complete lines from every VM.
+    /// Starts the boot-time mode that displays complete lines from eligible VMs.
+    #[cfg(test)]
     pub(crate) fn start_boot_multiplex(&mut self) {
         self.mode = OutputMode::BootMultiplex;
     }
@@ -94,7 +106,7 @@ impl GuestOutputMux {
         self.drain_guest_log(vm_id)
     }
 
-    /// Enters interactive mode on the first input and returns the buffered prompt.
+    /// Enters interactive mode on the first input and returns buffered output.
     pub(crate) fn select_foreground_on_input(&mut self, vm_id: usize) -> Vec<u8> {
         match self.mode {
             OutputMode::Interactive {
@@ -110,7 +122,7 @@ impl GuestOutputMux {
             .guests
             .iter()
             .filter(|(vm_id, _)| !running.contains(vm_id))
-            .map(|(_, guest)| guest.pending.len())
+            .map(|(_, guest)| guest.unseen_len())
             .sum::<usize>();
         self.guests.retain(|vm_id, _| running.contains(vm_id));
         self.total_pending -= discarded;
@@ -128,7 +140,7 @@ impl GuestOutputMux {
     /// Discards pending output for a replaced or stopped backend.
     pub(crate) fn reset_guest(&mut self, vm_id: usize) {
         if let Some(guest) = self.guests.remove(&vm_id) {
-            self.total_pending -= guest.pending.len();
+            self.total_pending -= guest.unseen_len();
         }
         if self.owner == Some(vm_id) {
             self.owner = None;
@@ -139,6 +151,7 @@ impl GuestOutputMux {
     }
 
     /// Requests that the next write from `vm_id` take physical-line ownership.
+    #[cfg(test)]
     pub(crate) fn request_preemption(&mut self, vm_id: usize) {
         self.preemption = Some(vm_id);
     }
@@ -150,14 +163,12 @@ impl GuestOutputMux {
         }
 
         self.append_log(vm_id, bytes);
-
         if !multiple_running {
             let pending = self
                 .guests
                 .get(&vm_id)
                 .expect("guest output queue was just created")
-                .pending
-                .len();
+                .unseen_len();
             let mut output = Vec::with_capacity(pending.saturating_add(1));
             if self.physical_line_open && self.owner != Some(vm_id) {
                 output.push(b'\n');
@@ -168,8 +179,9 @@ impl GuestOutputMux {
                 .guests
                 .get_mut(&vm_id)
                 .expect("guest output queue was just created");
-            self.total_pending -= guest.pending.len();
-            output.extend(guest.pending.drain(..));
+            output.extend(guest.pending.iter().skip(guest.replayed).copied());
+            self.total_pending -= guest.unseen_len();
+            guest.replayed = guest.pending.len();
             for &byte in &output {
                 guest.at_line_start = byte == b'\n';
                 self.physical_line_open = byte != b'\n';
@@ -183,14 +195,23 @@ impl GuestOutputMux {
         let mut output = Vec::with_capacity(self.total_pending.saturating_add(16));
         loop {
             let preferred = self.preemption.filter(|vm_id| {
-                self.guests
-                    .get(vm_id)
-                    .is_some_and(|guest| guest.pending.contains(&b'\n'))
+                self.guests.get(vm_id).is_some_and(|guest| {
+                    guest
+                        .pending
+                        .iter()
+                        .skip(guest.replayed)
+                        .any(|&byte| byte == b'\n')
+                })
             });
             let Some(next) = preferred.or_else(|| {
-                self.guests
-                    .iter()
-                    .find_map(|(&vm_id, guest)| guest.pending.contains(&b'\n').then_some(vm_id))
+                self.guests.iter().find_map(|(&vm_id, guest)| {
+                    guest
+                        .pending
+                        .iter()
+                        .skip(guest.replayed)
+                        .any(|&byte| byte == b'\n')
+                        .then_some(vm_id)
+                })
             }) else {
                 break;
             };
@@ -215,7 +236,8 @@ impl GuestOutputMux {
                 .get_mut(&next)
                 .expect("completed line must have guest state");
             guest.at_line_start = false;
-            while let Some(byte) = guest.pending.pop_front() {
+            while let Some(&byte) = guest.pending.get(guest.replayed) {
+                guest.replayed += 1;
                 self.total_pending -= 1;
                 output.push(byte);
                 self.physical_line_open = byte != b'\n';
@@ -242,6 +264,13 @@ impl GuestOutputMux {
         }
 
         let mut output = self.drain_guest_log(vm_id);
+        self.append_log(vm_id, bytes);
+        let guest = self
+            .guests
+            .get_mut(&vm_id)
+            .expect("foreground guest log was just appended");
+        self.total_pending -= guest.unseen_len();
+        guest.replayed = guest.pending.len();
         output.reserve(bytes.len());
         output.extend_from_slice(bytes);
         self.update_physical_line(vm_id, bytes);
@@ -249,11 +278,11 @@ impl GuestOutputMux {
     }
 
     fn drain_guest_log(&mut self, vm_id: usize) -> Vec<u8> {
-        let pending = self
+        let unseen = self
             .guests
             .get(&vm_id)
-            .map_or(0, |guest| guest.pending.len());
-        let mut output = Vec::with_capacity(pending.saturating_add(1));
+            .map_or(0, |guest| guest.pending.len() - guest.replayed);
+        let mut output = Vec::with_capacity(unseen.saturating_add(1));
         if self.physical_line_open && self.owner != Some(vm_id) {
             output.push(b'\n');
         }
@@ -261,8 +290,9 @@ impl GuestOutputMux {
         self.owner = Some(vm_id);
 
         let guest = self.guests.entry(vm_id).or_default();
-        self.total_pending -= guest.pending.len();
-        output.extend(guest.pending.drain(..));
+        output.extend(guest.pending.iter().skip(guest.replayed).copied());
+        self.total_pending -= guest.unseen_len();
+        guest.replayed = guest.pending.len();
         self.update_physical_line(vm_id, &output);
         output
     }
@@ -285,7 +315,11 @@ impl GuestOutputMux {
         for &byte in bytes {
             if guest.pending.len() == PER_GUEST_LOG_CAPACITY {
                 guest.pending.pop_front();
-                self.total_pending -= 1;
+                if guest.replayed == 0 {
+                    self.total_pending -= 1;
+                } else {
+                    guest.replayed -= 1;
+                }
             }
             guest.pending.push_back(byte);
             self.total_pending += 1;
@@ -293,7 +327,7 @@ impl GuestOutputMux {
     }
 
     #[cfg(test)]
-    fn pending_len(&self, vm_id: usize) -> usize {
+    pub(super) fn pending_len(&self, vm_id: usize) -> usize {
         self.guests
             .get(&vm_id)
             .map_or(0, |guest| guest.pending.len())
@@ -492,6 +526,22 @@ mod tests {
         assert!(mux.format(2, true, b"cached\n").is_empty());
 
         assert_eq!(mux.select_foreground(2), b"cached\n");
+        assert_eq!(mux.pending_len(2), 7);
+        mux.buffer_all();
+        assert!(mux.select_foreground(2).is_empty());
+    }
+
+    #[cfg_attr(axtest, axtest::axtest)]
+    #[cfg_attr(not(axtest), test)]
+    fn foreground_output_stays_in_the_ring_without_being_replayed() {
+        let mut mux = GuestOutputMux::default();
+        mux.enter_interactive(1);
+
+        assert_eq!(mux.format(1, false, b"live\n"), b"live\n");
+        assert_eq!(mux.pending_len(1), 5);
+
+        mux.buffer_all();
+        assert!(mux.select_foreground(1).is_empty());
     }
 
     #[cfg_attr(axtest, axtest::axtest)]
