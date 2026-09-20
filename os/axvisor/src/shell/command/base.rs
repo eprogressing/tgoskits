@@ -25,7 +25,7 @@ use std::string::{String, ToString};
 
 use crate::shell::command::{CommandNode, FlagDef, ParsedCommand};
 #[cfg(feature = "fs")]
-use axvisor::shell_support::{
+use axvisor::shell_fs::{
     CopyMode, RemoveOptions, collect_directory_entry_names, copy_operands, copy_path,
     move_file_or_dir, path_basename, remove_path, touch_file,
 };
@@ -134,7 +134,7 @@ fn do_cat(cmd: &ParsedCommand) {
         loop {
             let n = file.read(&mut buf)?;
             if n > 0 {
-                crate::guest_console::submit_host_bytes(&buf[..n]);
+                crate::shell::submit_shell_bytes(&buf[..n]);
             } else {
                 return Ok(());
             }

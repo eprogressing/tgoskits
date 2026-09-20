@@ -1,31 +1,31 @@
 //! Special devices
 
+mod axivc;
 mod card0;
 #[cfg(feature = "rknpu")]
-mod card1;
+pub(crate) mod card1;
 // The real contiguous coherent dma-heap is shared by every accelerator that
 // exchanges buffers (JPU / NPU / RGA).
 #[cfg(any(feature = "jpeg", feature = "rknpu", feature = "rga"))]
 mod dmaheap;
 mod drm;
-#[cfg(feature = "input")]
 pub mod event;
 mod fb;
 #[cfg(feature = "sg2002")]
 pub mod ion;
+mod irq_service;
 mod kmsg;
 #[cfg(feature = "k230-kpu")]
 mod kpu;
 #[cfg(feature = "dev-log")]
 mod log;
-mod r#loop;
+pub(crate) mod r#loop;
 #[cfg(feature = "memtrack")]
 mod memtrack;
 #[cfg(feature = "jpeg")]
 mod mpp_service;
 #[cfg(feature = "sg2002")]
 mod pinmux;
-#[cfg(any(feature = "sg2002", feature = "rk3588-pwm"))]
 pub(super) mod pwm;
 #[cfg(feature = "rga")]
 pub(crate) mod rga;
@@ -147,7 +147,7 @@ impl DeviceOps for Null {
     }
 
     fn flags(&self) -> NodeFlags {
-        NodeFlags::NON_CACHEABLE | NodeFlags::STREAM
+        NodeFlags::NON_CACHEABLE | NodeFlags::STREAM | NodeFlags::BLOCKING
     }
 }
 
@@ -209,7 +209,7 @@ impl Random {
         }
     }
 
-    #[cfg(axtest)]
+    #[cfg(all(test, axtest))]
     fn new_with_seed_for_test(seed: [u8; 32]) -> Self {
         Self {
             state: Mutex::new(RandomState::new(seed)),
@@ -235,13 +235,17 @@ impl RandomState {
     }
 
     fn mix_entropy(&mut self, entropy: &[u8]) {
+        self.mix_entropy_at(entropy, time_entropy());
+    }
+
+    fn mix_entropy_at(&mut self, entropy: &[u8], time_entropy: u64) {
         let mut seed = [0; 32];
         self.rng.fill_bytes(&mut seed);
 
         self.reseed_count = self.reseed_count.wrapping_add(1);
         fold_seed_word(&mut seed, entropy.len() as u64);
         fold_seed_word(&mut seed, self.reseed_count);
-        fold_seed_word(&mut seed, time_entropy());
+        fold_seed_word(&mut seed, time_entropy);
 
         for (idx, byte) in entropy.iter().copied().enumerate() {
             let seed_idx = idx % seed.len();
@@ -306,8 +310,8 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-#[cfg(axtest)]
-pub(crate) fn random_write_mixes_entropy_for_test() -> bool {
+#[cfg(all(test, axtest))]
+fn random_write_mixes_entropy_for_test() -> bool {
     let seed = *b"0123456789abcdef0123456789abcdef";
     let baseline = Random::new_with_seed_for_test(seed);
     let mixed = Random::new_with_seed_for_test(seed);
@@ -336,12 +340,7 @@ pub(crate) fn random_write_mixes_entropy_for_test() -> bool {
         && fold_seed_word_xors_into_byte_indices()
 }
 
-#[cfg(axtest)]
-pub(crate) fn kmsg_reports_no_readiness_without_read_side_for_test() -> bool {
-    kmsg::reports_no_readiness_without_read_side_for_test()
-}
-
-#[cfg(axtest)]
+#[cfg(test)]
 fn splitmix64_determinism_rules_hold() -> bool {
     // splitmix64 is a pure bijection: the same input always yields the same
     // 64-bit output (deterministic PRNG), and distinct inputs yield distinct
@@ -357,7 +356,7 @@ fn splitmix64_determinism_rules_hold() -> bool {
         && a != c
 }
 
-#[cfg(axtest)]
+#[cfg(test)]
 fn fold_seed_word_xors_into_byte_indices() -> bool {
     // fold_seed_word XORs splitmix64(word) into seed[idx*4 % 32]. Repeatedly
     // folding the same word twice must cancel out (XOR is its own inverse).
@@ -610,6 +609,8 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         ),
     );
 
+    axivc::register_devices(&mut root, fs.clone());
+
     #[cfg(feature = "k230-kpu")]
     {
         if let Some(kpu_device) = kpu::KpuDevice::probe().map(Arc::new) {
@@ -760,7 +761,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     }
 
     // Input devices
-    #[cfg(feature = "input")]
     root.add(
         "input",
         SimpleDir::new_maker(fs.clone(), Arc::new(event::input_devices(fs.clone()))),
@@ -827,4 +827,25 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
 
 fn descriptor_symlink(fs: Arc<SimpleFs>, target: &'static str) -> Arc<SimpleFile> {
     SimpleFile::new(fs, NodeType::Symlink, move || Ok(target))
+}
+
+#[cfg(all(test, axtest))]
+mod tests {
+    #[axtest::axtest]
+    fn random_write_mixes_entropy() {
+        assert!(super::random_write_mixes_entropy_for_test());
+    }
+}
+
+#[cfg(all(test, not(axtest)))]
+mod host_tests {
+    #[test]
+    fn splitmix64_is_deterministic() {
+        assert!(super::splitmix64_determinism_rules_hold());
+    }
+
+    #[test]
+    fn fold_seed_word_uses_the_expected_byte_indices() {
+        assert!(super::fold_seed_word_xors_into_byte_indices());
+    }
 }

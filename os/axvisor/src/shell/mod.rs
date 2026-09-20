@@ -13,28 +13,62 @@
 // limitations under the License.
 
 use std::io::prelude::*;
-use std::string::ToString;
+use std::string::{String, ToString};
 
-fn submit_shell_format(args: core::fmt::Arguments<'_>, newline: bool) {
-    let mut output = std::fmt::format(args);
-    if newline {
-        output.push('\n');
+#[cfg(feature = "browser-console")]
+use core::cell::Cell;
+
+#[cfg(feature = "browser-console")]
+std::thread_local! {
+    static NETWORK_OUTPUT_SELECTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Formats a text fragment submitted by the Axvisor shell.
+fn format_fragment(args: core::fmt::Arguments<'_>) -> String {
+    alloc::fmt::format(args)
+}
+
+/// Formats a complete text line submitted by the Axvisor shell.
+///
+/// The shared host-output queue preserves raw bytes because it also carries
+/// guest output. Shell-owned lines must therefore provide their own CRLF.
+fn format_line(args: core::fmt::Arguments<'_>) -> String {
+    let mut output = format_fragment(args);
+    output.push_str("\r\n");
+    output
+}
+
+fn submit_shell_fragment(args: core::fmt::Arguments<'_>) {
+    let output = format_fragment(args);
+    submit_shell_bytes(output.as_bytes());
+}
+
+fn submit_shell_line(args: core::fmt::Arguments<'_>) {
+    let output = format_line(args);
+    submit_shell_bytes(output.as_bytes());
+}
+
+pub(crate) fn submit_shell_bytes(bytes: &[u8]) {
+    #[cfg(feature = "browser-console")]
+    if NETWORK_OUTPUT_SELECTED.with(Cell::get) {
+        crate::network_console::submit_management_output(bytes);
+        return;
     }
-    crate::guest_console::submit_host_bytes(output.as_bytes());
+    crate::guest_console::submit_host_bytes(bytes);
 }
 
 macro_rules! print {
     ($($arg:tt)*) => {
-        crate::shell::submit_shell_format(format_args!($($arg)*), false)
+        crate::shell::submit_shell_fragment(format_args!($($arg)*))
     };
 }
 
 macro_rules! println {
     () => {
-        crate::shell::submit_shell_format(format_args!(""), true)
+        crate::shell::submit_shell_line(format_args!(""))
     };
     ($($arg:tt)*) => {
-        crate::shell::submit_shell_format(format_args!($($arg)*), true)
+        crate::shell::submit_shell_line(format_args!($($arg)*))
     };
 }
 
@@ -75,6 +109,32 @@ fn print_console_shortcuts() {
     println!("  Ctrl+X, then h  return to the Axvisor shell");
     println!("  Ctrl+X, then [  attach the previous running guest");
     println!("  Ctrl+X, then ]  attach the next running guest");
+}
+
+/// Executes one complete command for a connection-local network shell.
+///
+/// Returns `false` for `exit` and `quit`, which disconnect only that network
+/// client instead of shutting down the hypervisor.
+#[cfg(feature = "browser-console")]
+pub(crate) fn run_network_command(input: &str) -> bool {
+    let command = input.trim();
+    if matches!(command, "exit" | "quit") {
+        return false;
+    }
+
+    NETWORK_OUTPUT_SELECTED.with(|selected| {
+        let previous = selected.replace(true);
+        if !command.is_empty() && !handle_builtin_commands(command) {
+            run_cmd_bytes(command.as_bytes());
+        }
+        selected.set(previous);
+    });
+    true
+}
+
+#[cfg(feature = "browser-console")]
+pub(crate) fn network_prompt() -> String {
+    prompt_string()
 }
 
 fn route_pending_host_log(
@@ -147,6 +207,20 @@ pub fn console_init() {
 
         let dropped = crate::guest_console::take_host_log_drops();
         if let Some(record) = crate::guest_console::read_host_log() {
+            if let Some(tag) = record.output_tag() {
+                if dropped.records != 0 {
+                    route_pending_host_log(
+                        &[],
+                        &buf,
+                        cursor,
+                        line_len,
+                        dropped.records,
+                        dropped.source_bytes,
+                    );
+                }
+                crate::guest_console::replay_guest_output(tag, record.bytes());
+                continue;
+            }
             route_pending_host_log(
                 record.bytes(),
                 &buf,
@@ -168,7 +242,6 @@ pub fn console_init() {
             );
             continue;
         }
-
         let ch = match pending_shell_byte.take() {
             Some(ch) => ch,
             None => {

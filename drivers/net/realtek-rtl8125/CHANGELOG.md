@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/rcore-os/tgoskits/compare/realtek-rtl8125-v0.3.2...realtek-rtl8125-v0.3.3) - 2026-09-09
+
+### Other
+
+- updated the following local packages: rdif-eth
+
+## [0.3.2](https://github.com/rcore-os/tgoskits/compare/realtek-rtl8125-v0.3.1...realtek-rtl8125-v0.3.2) - 2026-09-09
+
+### Other
+
+- *(repo)* continue removing nonfunctional test scaffolding ([#2307](https://github.com/rcore-os/tgoskits/pull/2307))
+- *(net)* optimize RTL8125 data path and polling ([#2227](https://github.com/rcore-os/tgoskits/pull/2227))
+
+## [0.3.1](https://github.com/rcore-os/tgoskits/compare/realtek-rtl8125-v0.3.0...realtek-rtl8125-v0.3.1) - 2026-08-27
+
+### Other
+
+- *(sdmmc)* unify SDIO protocol and AIC8800 driver ([#2201](https://github.com/rcore-os/tgoskits/pull/2201))
+- *(ax-net)* add queue-level NAPI runtime ([#2178](https://github.com/rcore-os/tgoskits/pull/2178))
+
 ## [0.3.0](https://github.com/rcore-os/tgoskits/compare/realtek-rtl8125-v0.2.12...realtek-rtl8125-v0.3.0) - 2026-08-20
 
 ### Added

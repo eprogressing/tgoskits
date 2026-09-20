@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/rcore-os/tgoskits/compare/arm_vgic-v0.6.1...arm_vgic-v0.6.2) - 2026-09-09
+
+### Other
+
+- updated the following local packages: ax-sync
+
+## [0.6.1](https://github.com/rcore-os/tgoskits/compare/arm_vgic-v0.6.0...arm_vgic-v0.6.1) - 2026-08-27
+
+### Fixed
+
+- *(virtualization)* port isolated interrupt controller fixes ([#2199](https://github.com/rcore-os/tgoskits/pull/2199))
+
 ## [0.6.0](https://github.com/rcore-os/tgoskits/compare/arm_vgic-v0.5.6...arm_vgic-v0.6.0) - 2026-08-20
 
 ### Added

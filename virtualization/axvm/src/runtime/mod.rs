@@ -17,6 +17,7 @@ pub(crate) mod ivc;
 pub(crate) mod vcpus;
 
 mod dispatcher;
+mod kick;
 mod queue;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -24,6 +25,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // embed the dispatcher as a field and expose it to the vCPU run loop.
 #[allow(unused_imports)]
 pub(crate) use dispatcher::VcpuIrqDispatcher;
+#[cfg(target_arch = "x86_64")]
+pub(crate) use kick::HardIrqKick;
+pub(crate) use kick::VcpuKickHandle;
+pub(crate) use queue::QueuedVcpuInterrupt;
 
 use crate::{AxVmError, AxVmResult, StopReason, VmStatus, ax_err};
 
@@ -108,31 +113,20 @@ pub fn start_vm(vm_id: usize) -> AxVmResult {
     Ok(())
 }
 
-/// Wake the primary vCPU of a VM.
-///
-/// Single-vCPU guests retain pending device work across the WFI boundary.
-/// SMP guests keep the legacy wake-only behavior until AxVM provides a
-/// per-vCPU wait queue that can target vCPU0.
+/// Publishes device work and kicks the primary vCPU of a VM.
 pub fn notify_vm(vm_id: usize) -> AxVmResult {
     let vm = vm_by_id(vm_id)?;
-    let vcpu_num = vm.vcpu_num();
-    vm.with_runtime(|runtime| {
-        notify_runtime_for_device_poll(runtime, vcpu_num);
-        Ok(())
-    })
-}
-
-fn notify_runtime_for_device_poll(runtime: &crate::vm::VmRuntimeHandle, vcpu_num: usize) {
-    if vcpu_num == 1 {
-        runtime.notify_device_poll();
-    } else {
-        // The runtime wait queue is shared by all vCPUs, so notify_one cannot
-        // target vCPU0. Keep the legacy wake semantics for SMP guests until a
-        // dedicated per-vCPU wake path is available; publishing the shared
-        // device-poll flag here could keep a secondary vCPU spinning while
-        // the primary vCPU remains asleep.
-        runtime.notify_one();
-    }
+    // `WaitQueue::wait_until` evaluates the vCPU wake predicate while it
+    // holds both the wait-queue and run-queue locks. That predicate may read
+    // the VM lifecycle state and therefore lock `vm.machine`. Never retain
+    // `vm.machine` while notifying the same wait queue, or the notifier and a
+    // vCPU entering WFI can deadlock in opposite lock order.
+    let runtime = vm.runtime_handle()?;
+    runtime.publish_device_poll_request();
+    // Device polling is VM-wide state. Use the VM-work request path so the
+    // primary vCPU entry request is published before the shared generation is
+    // advanced, then kick only the primary poll owner.
+    runtime.request_vcpu_for_vm_work(0)
 }
 
 pub fn stop_vm(vm_id: usize) -> AxVmResult {
@@ -182,6 +176,20 @@ pub(crate) fn wait_until_vcpu_entered(
         BadState,
         "vCPU task did not enter the guest before request-stop"
     )
+}
+
+/// Pause a running VM.
+///
+/// `vm.pause()` flips the status to `Paused` synchronously; the running vCPUs
+/// observe the flag at their next run-loop iteration and park in the
+/// suspend-wait (`!suspending()`), so the guest actually suspends
+/// asynchronously. The notify wakes any vCPU parked in a WFI/event wait so it
+/// can reach that check.
+pub fn pause_vm(vm_id: usize) -> AxVmResult {
+    let vm = vm_by_id(vm_id)?;
+    vm.pause()?;
+    vcpus::notify_all_vcpus(vm_id);
+    Ok(())
 }
 
 pub fn resume_vm(vm_id: usize) -> AxVmResult {
@@ -251,21 +259,9 @@ mod tests {
     }
 
     #[test]
-    fn smp_notification_does_not_publish_a_shared_device_poll_request() {
+    fn device_notification_publishes_a_primary_vcpu_poll_request() {
         let runtime = crate::vm::VmRuntimeHandle::new();
-        let observed_generation = runtime.notification_generation();
-
-        notify_runtime_for_device_poll(&runtime, 2);
-
-        assert!(!runtime.device_poll_requested());
-        assert_ne!(runtime.notification_generation(), observed_generation);
-    }
-
-    #[test]
-    fn single_vcpu_notification_publishes_a_device_poll_request() {
-        let runtime = crate::vm::VmRuntimeHandle::new();
-
-        notify_runtime_for_device_poll(&runtime, 1);
+        runtime.publish_device_poll_request();
 
         assert!(runtime.device_poll_requested());
     }

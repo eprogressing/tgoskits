@@ -123,28 +123,49 @@ impl Aarch64VgicRuntime {
             return Err(error);
         }
 
-        self.kick.start();
-        if let Err(error) = self.core.bind_assigned_spis() {
-            self.kick.stop();
+        if let Err(error) = self.kick.start() {
             *self.phase.lock() = RuntimePhase::Inactive;
-            return Err(AxVmError::interrupt("bind assigned physical SPIs", error));
+            return Err(error);
+        }
+        if let Err(error) = self.core.bind_assigned_spis() {
+            let primary = AxVmError::interrupt("bind assigned physical SPIs", error);
+            let rollback = self.kick.stop();
+            *self.phase.lock() = RuntimePhase::Inactive;
+            return match rollback {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(AxVmError::lifecycle_rollback(
+                    "activate AArch64 VGIC runtime",
+                    primary,
+                    rollback,
+                )),
+            };
         }
 
         let routes = match gic::register_assigned_spi_routes(&self.core) {
             Ok(routes) => routes,
             Err(error) => {
-                if let Err(rollback_error) = self.core.unbind_assigned_spis() {
-                    warn!(
-                        "failed to roll back AArch64 assigned SPIs after route error: \
-                         {rollback_error}"
-                    );
-                }
-                self.kick.stop();
+                let primary = AxVmError::interrupt("register assigned physical SPI routes", error);
+                let unbind = self.core.unbind_assigned_spis();
+                let stop = self.kick.stop();
                 *self.phase.lock() = RuntimePhase::Inactive;
-                return Err(AxVmError::interrupt(
-                    "register assigned physical SPI routes",
-                    error,
-                ));
+                return match (unbind, stop) {
+                    (Ok(()), Ok(())) => Err(primary),
+                    (Err(rollback), Ok(())) => Err(AxVmError::lifecycle_rollback(
+                        "activate AArch64 VGIC runtime",
+                        primary,
+                        rollback,
+                    )),
+                    (Ok(()), Err(rollback)) => Err(AxVmError::lifecycle_rollback(
+                        "activate AArch64 VGIC runtime",
+                        primary,
+                        rollback,
+                    )),
+                    (Err(unbind), Err(stop)) => Err(AxVmError::lifecycle_rollback(
+                        "activate AArch64 VGIC runtime",
+                        primary,
+                        std::format_args!("{unbind}; {stop}"),
+                    )),
+                };
             }
         };
         *self.phase.lock() = RuntimePhase::Active(routes);
@@ -161,8 +182,8 @@ impl Aarch64VgicRuntime {
                     return Ok(());
                 }
                 RuntimePhase::Active(routes) => routes,
-                RuntimePhase::Activating | RuntimePhase::Deactivating => {
-                    *phase = RuntimePhase::Deactivating;
+                transition @ (RuntimePhase::Activating | RuntimePhase::Deactivating) => {
+                    *phase = transition;
                     return Err(AxVmError::resource_conflict(
                         "AArch64 VGIC lifecycle",
                         "another lifecycle transition is in progress",
@@ -184,9 +205,9 @@ impl Aarch64VgicRuntime {
         // Dropping the route handles removes the static hard-IRQ lookup before
         // the task-context kick worker is stopped.
         drop(routes);
-        self.kick.stop();
+        let stop = self.kick.stop();
         *self.phase.lock() = RuntimePhase::Inactive;
-        Ok(())
+        stop
     }
 }
 
@@ -210,6 +231,21 @@ struct Aarch64VcpuWake {
 
 impl GicV3VcpuWake for Aarch64VcpuWake {
     fn wake(&self) -> VgicResult {
+        if crate::vcpu::with_current_vcpu::<crate::arch::current::ArchVCpu, _>(|current| {
+            current.is_some_and(|vcpu| {
+                vcpu.vm_id() == self.kick.vm_id()
+                    && vcpu.id() == self.vcpu_id
+                    && vcpu.entry_loop_is_active()
+            })
+        }) {
+            // Canonical VGIC state was published before this callback. The
+            // owner loads it with local IRQs masked immediately before guest
+            // entry; IRQs stay masked through guest exit and VGIC save. Thus
+            // a local callback either precedes that load or follows the exit.
+            // The scoped publication excludes migration and sleeping vCPUs.
+            // Nonlocal and control-plane callbacks retain the deferred path.
+            return Ok(());
+        }
         self.kick
             .publish_from_irq(self.vcpu_id)
             .map_err(|error| VgicError::Backend {
@@ -227,6 +263,51 @@ struct Aarch64VgicFactory {
 impl DeviceModel for Aarch64VgicFactory {
     fn requirements(&self) -> DeviceManagerResult<DeviceRequirements> {
         self.plan.requirements()
+    }
+
+    fn firmware(&self) -> DeviceFirmwareSpec {
+        let mut fdt = match self.plan.config() {
+            ArmVgicConfig::V2(_) => {
+                FdtNodeSpec::new("interrupt-controller").with_compatible("arm,gic-400")
+            }
+            ArmVgicConfig::V3(_) => {
+                FdtNodeSpec::new("interrupt-controller").with_compatible("arm,gic-v3")
+            }
+        }
+        .with_register(ResourceSlot::new("distributor").expect("static VGIC slot is valid"));
+        let mut acpi = AcpiDeviceSpec::table("GIC0")
+            .with_register(ResourceSlot::new("distributor").expect("static VGIC slot is valid"));
+        match self.plan.config() {
+            ArmVgicConfig::V2(_) => {
+                let slot = ResourceSlot::new("cpu-region-0").expect("static VGIC slot is valid");
+                fdt = fdt.with_register(slot.clone());
+                acpi = acpi.with_register(slot);
+            }
+            ArmVgicConfig::V3(config) => {
+                for index in 0..config.redistributors().len() {
+                    let slot = ResourceSlot::new(std::format!("cpu-region-{index}"))
+                        .expect("generated VGIC slot is valid");
+                    fdt = fdt.with_register(slot.clone());
+                    acpi = acpi.with_register(slot);
+                }
+                for its in config.its() {
+                    let slot = ResourceSlot::new(std::format!("its-{}", its.id().value()))
+                        .expect("generated ITS slot is valid");
+                    fdt = fdt.with_register(slot.clone());
+                    acpi = acpi.with_register(slot);
+                }
+            }
+        }
+        DeviceFirmwareSpec::interfaces(
+            Some(std::vec![FdtContributionSpec::InterruptController {
+                controller: self.plan.config().controller_id(),
+                node: fdt,
+            }]),
+            Some(std::vec![AcpiContributionSpec::InterruptController {
+                controller: self.plan.config().controller_id(),
+                device: acpi,
+            }]),
+        )
     }
 
     fn build(&self, context: &mut DeviceBuildContext<'_>) -> DeviceManagerResult<DeviceBundle> {

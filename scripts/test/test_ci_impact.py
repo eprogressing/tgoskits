@@ -20,7 +20,7 @@ class CiImpactTests(unittest.TestCase):
         self.workspace_root = Path(self.temp_dir.name)
         package_dirs = {
             "shared": "components/shared",
-            "arm-vcpu": "virtualization/arm-vcpu",
+            "arm-vgic": "virtualization/arm-vgic",
             "standalone": "tools/standalone",
             "axtest": "components/axtest/axtest",
             "ktest-only": "components/ktest-only",
@@ -63,11 +63,11 @@ class CiImpactTests(unittest.TestCase):
 
     def _metadata(self, arch: str) -> dict:
         shared = self.package_ids["shared"]
-        arm_vcpu = self.package_ids["arm-vcpu"]
+        arm_vgic = self.package_ids["arm-vgic"]
         dependency_names = {
             "arceos-test-suit": ["shared"],
             "starryos": ["shared"],
-            "axvisor": ["shared"] + (["arm-vcpu"] if arch == "aarch64" else []),
+            "axvisor": ["shared"] + (["arm-vgic"] if arch == "aarch64" else []),
             "ktest-only": ["axtest"],
         }
         nodes = []
@@ -80,7 +80,7 @@ class CiImpactTests(unittest.TestCase):
                 deps.append({"pkg": self.package_ids[name], "dep_kinds": dep_kinds})
             nodes.append({"id": package["id"], "deps": deps})
         self.assertIn(shared, {node["id"] for node in nodes})
-        self.assertIn(arm_vcpu, {node["id"] for node in nodes})
+        self.assertIn(arm_vgic, {node["id"] for node in nodes})
         return {
             "workspace_root": str(self.workspace_root),
             "workspace_members": [package["id"] for package in self.packages],
@@ -115,7 +115,7 @@ class CiImpactTests(unittest.TestCase):
             self.workspace_root,
             [
                 Path("components/shared/src/lib.rs"),
-                Path("virtualization/arm-vcpu/README.md"),
+                Path("virtualization/arm-vgic/README.md"),
             ],
             self.metadata_by_arch,
         )
@@ -124,7 +124,7 @@ class CiImpactTests(unittest.TestCase):
         self.assertEqual(impact.changed_packages, ("shared",))
         self.assertEqual(
             impact.ignored_markdown,
-            ("virtualization/arm-vcpu/README.md",),
+            ("virtualization/arm-vgic/README.md",),
         )
         self.assertEqual(
             set(impact.targets),
@@ -140,7 +140,7 @@ class CiImpactTests(unittest.TestCase):
     ) -> None:
         impact = ci_impact.analyze_changed_paths(
             self.workspace_root,
-            [Path("virtualization/arm-vcpu/src/lib.rs")],
+            [Path("virtualization/arm-vgic/src/lib.rs")],
             self.metadata_by_arch,
         )
 
@@ -236,24 +236,6 @@ class CiImpactTests(unittest.TestCase):
             tuple(f"arceos:{arch}" for arch in ci_impact.ARCH_TARGETS),
         )
 
-    def test_known_config_names_map_to_board_architectures(self) -> None:
-        cases = {
-            "os/StarryOS/configs/board/visionfive2.toml": ("starry:riscv64",),
-            "os/StarryOS/configs/board/jl-lsgd2k10.toml": ("starry:loongarch64",),
-            "os/axvisor/configs/board/asus-nuc15crh-x86_64.toml": ("axvisor:x86_64",),
-            "os/axvisor/configs/board/orangepi-5-plus.toml": ("axvisor:aarch64",),
-        }
-        for changed_path, expected_targets in cases.items():
-            with self.subTest(path=changed_path):
-                impact = ci_impact.analyze_changed_paths(
-                    self.workspace_root,
-                    [Path(changed_path)],
-                    self.metadata_by_arch,
-                )
-
-                self.assertFalse(impact.full)
-                self.assertEqual(impact.targets, expected_targets)
-
     def test_deleted_package_manifest_falls_back_to_full(self) -> None:
         manifest = self.workspace_root / "tools/standalone/Cargo.toml"
         manifest.unlink()
@@ -316,34 +298,115 @@ class CiImpactTests(unittest.TestCase):
         self.assertTrue(impact.full)
         load_metadata.assert_not_called()
 
-    def test_summary_reports_selected_and_skipped_checks(self) -> None:
-        impact = ci_impact.CiImpact(
-            full=False,
-            reason="fixture",
-            changed_paths=("components/shared/src/lib.rs",),
-            ignored_markdown=("components/shared/README.md",),
-            changed_packages=("shared",),
-            affected_packages=("shared", "starryos"),
-            targets=("starry:aarch64",),
+    def test_cargo_lock_does_not_expand_a_resolved_package_change(self) -> None:
+        ci_owned_manifest = (
+            self.workspace_root / "apps/arceos/virtio-blk-test/Cargo.toml"
+        )
+        ci_owned_manifest.parent.mkdir(parents=True, exist_ok=True)
+        ci_owned_manifest.write_text("[package]\n", encoding="utf-8")
+
+        with (
+            mock.patch.object(
+                ci_impact,
+                "changed_paths_since",
+                return_value=[
+                    Path("Cargo.lock"),
+                    Path("apps/arceos/virtio-blk-test/Cargo.toml"),
+                    Path("virtualization/arm-vgic/src/lib.rs"),
+                ],
+            ),
+            mock.patch.object(
+                ci_impact,
+                "load_metadata_by_arch",
+                return_value=self.metadata_by_arch,
+            ) as load_metadata,
+        ):
+            impact = ci_impact.analyze_pull_request(self.workspace_root, "base")
+
+        self.assertFalse(impact.full)
+        self.assertEqual(impact.changed_packages, ("arm-vgic",))
+        self.assertEqual(impact.affected_oses, ("axvisor",))
+        self.assertEqual(
+            impact.input_selections,
+            ("axvisor:qemu:aarch64",),
+        )
+        self.assertNotIn("starry:aarch64", impact.targets)
+        load_metadata.assert_called_once_with(self.workspace_root)
+
+    def test_cargo_lock_only_still_falls_back_to_full(self) -> None:
+        with (
+            mock.patch.object(
+                ci_impact,
+                "changed_paths_since",
+                return_value=[Path("Cargo.lock")],
+            ),
+            mock.patch.object(ci_impact, "load_metadata_by_arch") as load_metadata,
+        ):
+            impact = ci_impact.analyze_pull_request(self.workspace_root, "base")
+
+        self.assertTrue(impact.full)
+        self.assertIn("Cargo.lock", impact.reason)
+        load_metadata.assert_not_called()
+
+    def test_cargo_lock_does_not_break_exclusive_test_suite_routing(self) -> None:
+        impact = ci_impact.analyze_changed_paths(
+            self.workspace_root,
+            [
+                Path("Cargo.lock"),
+                Path("test-suit/starryos/qemu/system/qemu-aarch64.toml"),
+            ],
+            {},
         )
 
-        summary = ci_impact.render_summary(
-            impact,
-            ["run-clippy", "test-starry-aarch64-qemu"],
-            ["test-starry-x86-64-qemu"],
+        self.assertFalse(impact.full)
+        self.assertTrue(impact.exclusive)
+        self.assertEqual(
+            impact.test_suite_paths,
+            ("test-suit/starryos/qemu/system/qemu-aarch64.toml",),
         )
 
-        self.assertIn("components/shared/src/lib.rs", summary)
-        self.assertIn("components/shared/README.md", summary)
-        self.assertIn("starry:aarch64", summary)
-        self.assertIn("Selected checks (2)", summary)
-        self.assertIn("Skipped checks (1)", summary)
+    def test_cargo_lock_with_precise_input_skips_metadata_loading(self) -> None:
+        with (
+            mock.patch.object(
+                ci_impact,
+                "changed_paths_since",
+                return_value=[
+                    Path("Cargo.lock"),
+                    Path("os/axvisor/configs/qemu/aarch64.toml"),
+                ],
+            ),
+            mock.patch.object(ci_impact, "load_metadata_by_arch") as load_metadata,
+        ):
+            impact = ci_impact.analyze_pull_request(self.workspace_root, "base")
+
+        self.assertFalse(impact.full)
+        self.assertEqual(
+            impact.input_selections,
+            ("axvisor:qemu:aarch64",),
+        )
+        load_metadata.assert_not_called()
+
+    def test_cargo_lock_with_only_ignored_paths_still_falls_back_to_full(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                ci_impact,
+                "changed_paths_since",
+                return_value=[Path("Cargo.lock"), Path("README.md")],
+            ),
+            mock.patch.object(ci_impact, "load_metadata_by_arch") as load_metadata,
+        ):
+            impact = ci_impact.analyze_pull_request(self.workspace_root, "base")
+
+        self.assertTrue(impact.full)
+        self.assertEqual(impact.ignored_markdown, ("README.md",))
+        load_metadata.assert_not_called()
 
     def test_unknown_and_global_paths_fall_back_to_full(self) -> None:
         for changed_path in (
             "unknown/input.bin",
             "Cargo.toml",
-            "Cargo.lock",
             ".cargo/config.toml",
             "scripts/axbuild/src/lib.rs",
             "scripts/test/ci_plan.py",

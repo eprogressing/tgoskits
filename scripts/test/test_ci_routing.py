@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import os
 import subprocess
 import tempfile
@@ -7,11 +8,162 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from scripts.test.check_ci_routing import named_step_block
+from scripts.test.check_ci_routing import mapping_block, named_step_block
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 CI_WORKFLOW = WORKSPACE_ROOT / ".github/workflows/ci.yml"
+REUSABLE_CHECK_MATRIX = (
+    WORKSPACE_ROOT / ".github/workflows/reusable-check-matrix.yml"
+)
+PR_CLEANUP_WORKFLOW = WORKSPACE_ROOT / ".github/workflows/ci-pr-cleanup.yml"
+
+
+class ReleasePrerequisiteTests(unittest.TestCase):
+    def test_semver_checks_install_libudev_before_release_plz(self) -> None:
+        workflow = (
+            WORKSPACE_ROOT / ".github/workflows/release-plz.yml"
+        ).read_text(encoding="utf-8")
+        job = mapping_block(workflow, "release-plz-pr", 2)
+        setup = named_step_block(job, "Install semver-check system dependencies")
+
+        self.assertTrue(setup, "semver checks require the libudev development files")
+        self.assertIn("sudo apt-get update", setup)
+        self.assertRegex(
+            setup,
+            r"sudo apt-get install --yes (?:pkg-config libudev-dev|libudev-dev pkg-config)",
+        )
+        self.assertLess(job.index(setup), job.index("- name: Run release-plz"))
+
+
+class RunnerTrustTests(unittest.TestCase):
+    def test_public_job_images_do_not_require_registry_login(self) -> None:
+        workflow = REUSABLE_CHECK_MATRIX.read_text(encoding="utf-8")
+        job = mapping_block(workflow, "run", 2)
+        container = mapping_block(job, "container", 4)
+        credentials = mapping_block(container, "credentials", 6)
+
+        # A nonempty username prevents the runner's implicit GITHUB_TOKEN
+        # fallback; an omitted password makes ContainerRegistryLogin skip login.
+        self.assertIn("        username: anonymous", credentials.splitlines())
+        # Actions rejects an explicitly empty password before any job starts.
+        self.assertNotRegex(credentials, r"(?m)^\s*password:")
+
+    def test_cleanup_reuses_planning_runner(self) -> None:
+        self.assertFalse(
+            PR_CLEANUP_WORKFLOW.exists(),
+            "stale-run cleanup must not allocate a separate workflow runner",
+        )
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        job = mapping_block(workflow, "plan_ci", 2)
+        cleanup = named_step_block(job, "Cancel older queued or running runs")
+        self.assertTrue(cleanup)
+        self.assertIn("actions: write", mapping_block(job, "permissions", 4))
+        self.assertLess(
+            job.index("- name: Cancel older queued or running runs"),
+            job.index("- name: Checkout code"),
+        )
+        self.assertNotIn("steps.route.outputs.should_run", cleanup)
+
+    def test_cross_repository_pr_can_enter_planning_and_matrix_allocation(
+        self,
+    ) -> None:
+        for workflow_path, job_name, scheduled in (
+            (CI_WORKFLOW, "plan_ci", False),
+            (REUSABLE_CHECK_MATRIX, "run", True),
+        ):
+            with self.subTest(workflow=workflow_path.name):
+                workflow = workflow_path.read_text(encoding="utf-8")
+                job = mapping_block(workflow, job_name, 2)
+                condition = mapping_block(job.replace("if: >-", "if:"), "if", 4)
+                expected = (
+                    "github.event_name == 'push' || "
+                    "github.event_name == 'workflow_dispatch' || "
+                    + ("github.event_name == 'schedule' || " if scheduled else "")
+                    + "github.event_name == 'pull_request'"
+                )
+                self.assertEqual(" ".join(condition.split()), expected)
+
+    def test_fork_push_keeps_its_own_workflow_entry(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        triggers = mapping_block(workflow, "on", 0)
+        push = mapping_block(triggers, "push", 2)
+        self.assertTrue(push)
+        self.assertFalse(mapping_block(push, "branches", 4))
+        job = mapping_block(workflow, "plan_ci", 2)
+        condition = mapping_block(job.replace("if: >-", "if:"), "if", 4)
+        self.assertIn("github.event_name == 'push'", condition)
+        self.assertNotIn("rcore-os", condition)
+
+
+class ConcurrencyRoutingTests(unittest.TestCase):
+    def test_main_and_dev_use_distinct_fifo_groups(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        concurrency = mapping_block(workflow, "concurrency", 0)
+
+        self.assertIn("github.event_name != 'pull_request'", concurrency)
+        self.assertIn("github.ref == 'refs/heads/main'", concurrency)
+        self.assertIn("github.ref == 'refs/heads/dev'", concurrency)
+        self.assertIn(
+            "format('ci-{0}-{1}', github.workflow, github.ref)", concurrency
+        )
+        self.assertIn(
+            "format('ci-{0}-{1}', github.workflow, github.run_id)", concurrency
+        )
+        self.assertIn("queue: max", concurrency)
+
+
+class MatrixParallelismTests(unittest.TestCase):
+    def test_self_hosted_matrix_waits_for_preflight_then_runs_in_parallel(
+        self,
+    ) -> None:
+        ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        jobs = mapping_block(ci_workflow, "jobs", 0)
+
+        for job_name in (
+            "workspace_checks",
+            "arceos_checks",
+            "starry_checks",
+            "axvisor_checks",
+        ):
+            with self.subTest(job_name=job_name):
+                job = mapping_block(jobs, job_name, 2)
+                needs = mapping_block(job, "needs", 4)
+                self.assertIn("- plan_ci", needs)
+                self.assertIn("- static_checks", needs)
+
+        reusable_workflow = REUSABLE_CHECK_MATRIX.read_text(encoding="utf-8")
+        strategy = mapping_block(reusable_workflow, "strategy", 4)
+        self.assertIn("max-parallel: ${{ inputs.max_parallel }}", strategy)
+        self.assertRegex(
+            reusable_workflow,
+            r"(?ms)^      max_parallel:\n.*?^        default: (?:[2-9]|[1-9][0-9]+)$",
+        )
+
+
+class WifiSecretRoutingTests(unittest.TestCase):
+    def test_non_wifi_matrix_rows_remove_empty_wifi_environment(self) -> None:
+        workflow = REUSABLE_CHECK_MATRIX.read_text(encoding="utf-8")
+        step = named_step_block(workflow, "Run command")
+
+        self.assertIn("WIFI_SECRETS: ${{ matrix.wifi_secrets }}", step)
+        self.assertIn('if [ "${WIFI_SECRETS}" != "true" ]; then', step)
+        self.assertIn("unset STARRY_WIFI_SSID STARRY_WIFI_PASSWORD", step)
+
+
+class ForkCleanupPermissionTests(unittest.TestCase):
+    def test_main_cleanup_skips_fork_pull_requests(self) -> None:
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        cleanup_step = named_step_block(
+            workflow,
+            "Cancel older queued or running runs",
+        )
+
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            cleanup_step,
+        )
+        self.assertIn("github.event_name != 'pull_request'", cleanup_step)
 
 
 class DuplicateEventRoutingTests(unittest.TestCase):
@@ -201,6 +353,82 @@ class StaleRunCancellationTests(unittest.TestCase):
             any("actions/runs/101/force-cancel" in call for call in result.gh_calls)
         )
 
+    def test_pull_request_cancels_only_older_matching_head_runs(self) -> None:
+        result = run_cancellation(
+            event_name="pull_request",
+            pr_number="2078",
+            pr_head_ref="feat/axvisor-ai-rtos-integration",
+            pr_head_repository_id="1329374417",
+            runs=[
+                fake_run(
+                    run_id=101,
+                    run_number=100,
+                    event="pull_request",
+                    head_branch="feat/axvisor-ai-rtos-integration",
+                    head_repository_id=1329374417,
+                ),
+                fake_run(
+                    run_id=102,
+                    run_number=101,
+                    event="pull_request",
+                    head_branch="another-branch",
+                    head_repository_id=1329374417,
+                ),
+                fake_run(
+                    run_id=103,
+                    run_number=102,
+                    event="pull_request",
+                    head_branch="feat/axvisor-ai-rtos-integration",
+                    head_repository_id=999,
+                ),
+                fake_run(
+                    run_id=104,
+                    run_number=103,
+                    event="push",
+                    head_branch="feat/axvisor-ai-rtos-integration",
+                    head_repository_id=1329374417,
+                ),
+                fake_run(
+                    run_id=105,
+                    run_number=200,
+                    event="pull_request",
+                    head_branch="feat/axvisor-ai-rtos-integration",
+                    head_repository_id=1329374417,
+                ),
+                fake_run(
+                    run_id=106,
+                    run_number=104,
+                    event="pull_request",
+                    head_branch="feat/axvisor-ai-rtos-integration",
+                    head_repository_id=1329374417,
+                    pull_request_number=999,
+                ),
+            ],
+        )
+
+        cancelled_run_ids = cancelled_runs(result)
+        self.assertEqual(cancelled_run_ids, {101})
+
+    def test_pull_request_number_match_remains_supported(self) -> None:
+        result = run_cancellation(
+            event_name="pull_request",
+            pr_number="2078",
+            pr_head_ref="current-branch",
+            pr_head_repository_id="42",
+            runs=[
+                fake_run(
+                    run_id=107,
+                    run_number=100,
+                    event="pull_request",
+                    head_branch="historical-branch-name",
+                    head_repository_id=99,
+                    pull_request_number=2078,
+                )
+            ],
+        )
+
+        self.assertEqual(cancelled_runs(result), {107})
+
 
 class RouteResult:
     def __init__(
@@ -307,8 +535,26 @@ def route_script() -> str:
     return workflow_step_script("Route duplicate events")
 
 
-def run_cancellation() -> RouteResult:
+def run_cancellation(
+    *,
+    event_name: str = "push",
+    ref_name: str = "fix/qemu-forward-progress",
+    pr_number: str = "",
+    pr_head_ref: str = "",
+    pr_head_repository_id: str = "",
+    runs: list[dict[str, object]] | None = None,
+) -> RouteResult:
     script = workflow_step_script("Cancel older queued or running runs")
+    if runs is None:
+        runs = [
+            fake_run(
+                run_id=101,
+                run_number=100,
+                event="push",
+                head_branch=ref_name,
+                head_repository_id=1,
+            )
+        ]
     with tempfile.TemporaryDirectory() as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         bin_dir = temp_dir / "bin"
@@ -325,12 +571,16 @@ def run_cancellation() -> RouteResult:
         env.update(
             {
                 "CURRENT_RUN_NUMBER": "200",
-                "EVENT_NAME": "push",
+                "EVENT_NAME": event_name,
+                "FAKE_CANCEL_RUNS": json.dumps(runs),
                 "FAKE_GH_LOG": str(gh_log),
+                "FAKE_RECHECK_STATUS": "queued",
                 "GITHUB_REPOSITORY": "rcore-os/tgoskits",
                 "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
-                "PR_NUMBER": "",
-                "REF_NAME": "fix/qemu-forward-progress",
+                "PR_HEAD_REF": pr_head_ref,
+                "PR_HEAD_REPOSITORY_ID": pr_head_repository_id,
+                "PR_NUMBER": pr_number,
+                "REF_NAME": ref_name,
             }
         )
         completed = subprocess.run(
@@ -353,6 +603,38 @@ def run_cancellation() -> RouteResult:
             completed.stderr,
             gh_log.read_text(encoding="utf-8").splitlines(),
         )
+
+
+def fake_run(
+    *,
+    run_id: int,
+    run_number: int,
+    event: str,
+    head_branch: str,
+    head_repository_id: int,
+    pull_request_number: int | None = None,
+) -> dict[str, object]:
+    pull_requests = (
+        [] if pull_request_number is None else [{"number": pull_request_number}]
+    )
+    return {
+        "event": event,
+        "head_branch": head_branch,
+        "head_repository": {"id": head_repository_id},
+        "html_url": f"https://example.test/runs/{run_id}",
+        "id": run_id,
+        "pull_requests": pull_requests,
+        "run_number": run_number,
+        "status": "queued",
+    }
+
+
+def cancelled_runs(result: RouteResult) -> set[int]:
+    return {
+        int(call.split("actions/runs/", maxsplit=1)[1].split("/cancel", maxsplit=1)[0])
+        for call in result.gh_calls
+        if "/cancel" in call and "/force-cancel" not in call
+    }
 
 
 def workflow_step_script(step_name: str) -> str:
@@ -408,7 +690,10 @@ sys.exit(2)
 
 
 FAKE_CANCEL_GH = r'''#!/usr/bin/env python3
+import json
 import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -417,17 +702,32 @@ arguments = " ".join(sys.argv[1:])
 with Path(os.environ["FAKE_GH_LOG"]).open("a", encoding="utf-8") as log:
     log.write(arguments + "\n")
 
-if "actions/workflows/ci.yml/runs?status=queued" in arguments:
-    print("101\t11975\thttps://example.test/push/101")
-    sys.exit(0)
 if "actions/workflows/ci.yml/runs?status=" in arguments:
+    status = re.search(r"status=([^& ]+)", arguments).group(1)
+    runs = [
+        run
+        for run in json.loads(os.environ["FAKE_CANCEL_RUNS"])
+        if run["status"] == status
+    ]
+    jq_index = sys.argv.index("--jq")
+    completed = subprocess.run(
+        ["jq", "-r", sys.argv[jq_index + 1]],
+        input=json.dumps({"workflow_runs": runs}),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    sys.stdout.write(completed.stdout)
+    sys.stderr.write(completed.stderr)
+    sys.exit(completed.returncode)
+
+cancel_match = re.search(r"actions/runs/(\d+)/(?:force-)?cancel", arguments)
+if cancel_match:
     sys.exit(0)
-if "actions/runs/101/force-cancel" in arguments:
-    sys.exit(0)
-if "actions/runs/101/cancel" in arguments:
-    sys.exit(0)
-if "actions/runs/101" in arguments:
-    print("queued")
+
+run_match = re.search(r"actions/runs/(\d+)", arguments)
+if run_match:
+    print(os.environ["FAKE_RECHECK_STATUS"])
     sys.exit(0)
 
 print(f"unexpected gh invocation: {arguments}", file=sys.stderr)

@@ -13,6 +13,12 @@ SPEC = importlib.util.spec_from_file_location("ci_plan", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 ci_plan = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ci_plan)
+PERF_REPORT_SPEC = importlib.util.spec_from_file_location(
+    "ci_perf_report", MODULE_PATH.with_name("ci_perf_report.py")
+)
+assert PERF_REPORT_SPEC is not None and PERF_REPORT_SPEC.loader is not None
+ci_perf_report = importlib.util.module_from_spec(PERF_REPORT_SPEC)
+PERF_REPORT_SPEC.loader.exec_module(ci_perf_report)
 
 MAIN_TEST_PREFIXES = ("workspace", "arceos", "starry", "axvisor")
 MAIN_TEST_GROUPS = ("Workspace", "ArceOS", "Starry", "AxVisor")
@@ -27,6 +33,162 @@ def main_test_rows(plan: dict) -> list[dict]:
 
 
 class CiPlanTests(unittest.TestCase):
+    def test_axvisor_nightly_runs_all_registered_checks_with_artifact_producer(self):
+        catalog = ci_plan.load_catalog(ci_plan.MAIN_MANIFESTS)
+        expected = {check["id"] for check in catalog if check["group"] == "AxVisor"}
+        for event in ("schedule", "workflow_dispatch"):
+            with self.subTest(event=event):
+                context = ci_plan.PlanContext(
+                    repository="rcore-os/tgoskits",
+                    repository_owner="rcore-os",
+                    event_name=event,
+                )
+                plan = ci_plan.build_axvisor_nightly_plan(context)
+                rows = plan["axvisor_matrix"]["include"]
+                self.assertEqual({row["id"] for row in rows}, expected)
+                self.assertEqual(len(rows), len(expected))
+                self.assertTrue(any(
+                    "--board orangepi-5-plus-linux --test-case ping" in row["command"]
+                    for row in rows
+                ))
+                producer, = plan["prepare_matrix"]["include"]
+                self.assertTrue(producer["upload_xtask_bin_artifact"])
+                self.assertEqual(producer["command"], "cargo build -p tg-xtask")
+                for row in rows:
+                    if row["download_xtask_bin_artifact"]:
+                        self.assertEqual(
+                            row["xtask_bin_artifact_name"], producer["xtask_bin_artifact_name"]
+                        )
+                performance_rows = {
+                    row["id"]
+                    for row in rows
+                    if row["performance_report"]
+                }
+                self.assertEqual(
+                    performance_rows,
+                    {
+                        "test-axvisor-self-hosted-board-orangepi-5-plus-ivc-benchmark",
+                        "test-axvisor-self-hosted-board-orangepi-5-plus-vcpu-perf",
+                    },
+                )
+                main = ci_plan.build_main_plan(context)
+                nightly_ids = {
+                    check["id"] for check in catalog if check.get("nightly_only", False)
+                }
+                self.assertEqual(
+                    [row for row in rows if row["id"] not in nightly_ids],
+                    main["axvisor_matrix"]["include"],
+                )
+
+    def test_main_ci_never_runs_axvisor_nightly_only_cases(self):
+        for event in ("pull_request", "push", "workflow_dispatch", "schedule"):
+            with self.subTest(event=event):
+                context = ci_plan.replace(self.upstream, event_name=event)
+                rows = ci_plan.build_main_plan(context)["axvisor_matrix"]["include"]
+                commands = "\n".join(row["command"] for row in rows)
+                self.assertNotIn("timer-stress", commands)
+                self.assertNotIn("ivc-benchmark", commands)
+                self.assertNotIn("orangepi-5-plus-vcpu-perf", commands)
+                self.assertNotIn("--test-case ping", commands)
+                self.assertIn("--board orangepi-5-plus-linux --test-case smoke", commands)
+                self.assertNotIn("--board orangepi-5-plus-linux\n", commands)
+                self.assertIn("--test-case qemu-ivc", commands)
+                self.assertIn("--board orangepi-5-plus-starry", commands)
+
+    def test_nightly_only_suite_changes_keep_static_checks_without_running_board(self):
+        for path in (
+            "test-suit/axvisor/normal/qemu-timer-stress/gicv3-timer-stress/qemu-aarch64.toml",
+            "test-suit/axvisor/normal/board-orangepi-5-plus/ivc-benchmark/benchmark/board-orangepi-5-plus-ivc-benchmark.toml",
+            "test-suit/axvisor/normal/board-orangepi-5-plus/pci-network/ping/board-orangepi-5-plus-linux.toml",
+            "test-suit/axvisor/normal/board-orangepi-5-plus/vcpu-perf/performance/board-orangepi-5-plus-vcpu-perf.toml",
+        ):
+            with self.subTest(path=path):
+                context = ci_plan.replace(
+                    self.upstream,
+                    impact=ci_plan.CiImpact(
+                        full=False, reason="fixture", changed_paths=(path,),
+                        test_suite_paths=(path,), exclusive=True,
+                    ),
+                )
+                plan = ci_plan.build_main_plan(context)
+                self.assertTrue(plan["static_required"])
+                self.assertFalse(main_test_rows(plan))
+                self.assertFalse(plan["axvisor_required"])
+
+    def test_axvisor_nightly_rejects_incremental_pr_mode(self):
+        with self.assertRaises(ci_plan.PlanError):
+            ci_plan.build_axvisor_nightly_plan(self.upstream)
+
+    def test_performance_report_renders_supported_axvisor_results(self):
+        report = ci_perf_report.render_report(
+            "test-axvisor-self-hosted-board-orangepi-5-plus-vcpu-perf",
+            "Board OrangePi 5 Plus · Single ArceOS guest performance",
+            "\n".join(
+                [
+                    "[VM 1] VCPU_PERF_SAMPLE index=0 blocks=1099483 "
+                    "elapsed_ns=3000001123 timer_wakes=3011 checksum=841832",
+                    "[VM 1] VCPU_PERF_SAMPLE index=1 blocks=1100123 "
+                    "elapsed_ns=3000000987 timer_wakes=3010 checksum=841890",
+                    "[VM 1] VCPU_PERF_RESULT blocks_per_second=365334.20 "
+                    "baseline=364822.00 threshold=328339.80 samples=[364474.50,365334.20]",
+                    "[VM 1] VCPU_PERF_PASS",
+                ]
+            ),
+        )
+
+        self.assertIn("#### vCPU samples (per window)", report)
+        self.assertIn(
+            "| index | blocks | elapsed_ns | timer_wakes | checksum |", report
+        )
+        self.assertIn("| 1 | 1100123 | 3000000987 | 3010 | 841890 |", report)
+        self.assertIn("#### vCPU throughput result", report)
+        self.assertIn(
+            "| blocks_per_second | baseline | threshold | samples |", report
+        )
+        self.assertIn(
+            "| 365334.20 | 364822.00 | 328339.80 | [364474.50,365334.20] |", report
+        )
+
+    def test_performance_report_renders_axivc_benchmark_result(self):
+        report = ci_perf_report.render_report(
+            "test-axvisor-self-hosted-board-orangepi-5-plus-ivc-benchmark",
+            "Board OrangePi 5 Plus · AXIVC Zephyr-Starry benchmark",
+            "\n".join(
+                [
+                    "[test_output] ========================================",
+                    "[test_output] average sendBandwidth = 2263.10 MB/s, "
+                    "average receiveBandwidth = 1505.03 MB/s, "
+                    "testTime = 100, datasize = 262144",
+                    "[test_output] average sendBandwidth = 2287.42 MB/s, "
+                    "average receiveBandwidth = 2045.21 MB/s, "
+                    "testTime = 100, datasize = 1048576",
+                    "AXVISOR_IVC_BENCH_RESULT=PASS cases=4 testTime=100 "
+                    "bytes=1232076800 chunks=400",
+                ]
+            ),
+        )
+
+        self.assertIn("#### AXIVC benchmark per-case bandwidth", report)
+        self.assertIn(
+            "| datasize | sendBandwidth (MB/s) | receiveBandwidth (MB/s) | testTime |",
+            report,
+        )
+        self.assertIn("| 262144 (256 KiB) | 2263.10 | 1505.03 | 100 |", report)
+        self.assertIn("| 1048576 (1 MiB) | 2287.42 | 2045.21 | 100 |", report)
+        self.assertIn("#### AXIVC benchmark result", report)
+        self.assertIn("| status | cases | testTime | bytes | chunks |", report)
+        self.assertIn("| PASS | 4 | 100 | 1232076800 | 400 |", report)
+
+    def test_axvisor_nightly_preserves_runner_owner_restrictions(self):
+        context = ci_plan.PlanContext(
+            repository="example/tgoskits",
+            repository_owner="example",
+            event_name="workflow_dispatch",
+        )
+        rows = ci_plan.build_axvisor_nightly_plan(context)["axvisor_matrix"]["include"]
+        self.assertTrue(rows)
+        self.assertTrue(all("self-hosted" not in row["runs_on"] for row in rows))
+
     def setUp(self) -> None:
         self.upstream = ci_plan.PlanContext(
             repository="rcore-os/tgoskits",
@@ -35,7 +197,7 @@ class CiPlanTests(unittest.TestCase):
             base_ref="dev",
         )
 
-    def test_upstream_main_plan_preserves_required_checks_and_runner_policy(
+    def test_main_plan_has_unique_checks_in_required_groups(
         self,
     ) -> None:
         plan = ci_plan.build_main_plan(self.upstream)
@@ -45,39 +207,11 @@ class CiPlanTests(unittest.TestCase):
         test_rows = self.assert_unique_ids(main_test_rows(plan))
         self.assertNotIn("test_matrix", plan)
         self.assertTrue(static_rows.keys().isdisjoint(test_rows))
-        rows = static_rows | test_rows
         for prefix, group in zip(MAIN_TEST_PREFIXES, MAIN_TEST_GROUPS, strict=True):
             group_rows = plan[f"{prefix}_matrix"]["include"]
             self.assertTrue(plan[f"{prefix}_required"])
             self.assertTrue(group_rows)
             self.assertTrue(all(row["group"] == group for row in group_rows))
-        expected_runners = {
-            "check-formatting": ["self-hosted", "linux", "qcs"],
-            "run-sync-lint": ["ubuntu-latest"],
-            "run-clippy": ["self-hosted", "linux", "qcs"],
-            "test-with-std": ["self-hosted", "linux", "qcs"],
-            "test-arceos-x86-64-qemu": ["self-hosted", "linux", "qcs"],
-            "test-axvisor-aarch64-qemu-http-control-plane": [
-                "self-hosted",
-                "linux",
-                "qcs",
-            ],
-            "test-starry-aarch64-qemu": ["ubuntu-latest"],
-            "test-starry-self-hosted-board-visionfive2": [
-                "self-hosted",
-                "linux",
-                "board",
-            ],
-        }
-        for check_id, runs_on in expected_runners.items():
-            self.assertIn(check_id, rows)
-            self.assertEqual(rows[check_id]["runs_on"], runs_on)
-        sync_lint_command = static_rows["run-sync-lint"]["command"]
-        self.assertIn(
-            'cargo xtask sync-lint --since "$SINCE_REF"',
-            sync_lint_command,
-        )
-        self.assertNotIn("lock" + "-lint", sync_lint_command)
         self.assertTrue(
             all(
                 not row["name"].startswith(f"{row['group']} / ")
@@ -200,7 +334,7 @@ class CiPlanTests(unittest.TestCase):
         impact = ci_plan.CiImpact(
             full=False,
             reason="must be ignored outside pull requests",
-            changed_paths=("virtualization/arm_vcpu/src/lib.rs",),
+            changed_paths=("components/axcpu/src/arch/aarch64/mod.rs",),
             targets=("axvisor:aarch64",),
         )
         for event_name in ("push", "workflow_dispatch"):
@@ -286,6 +420,55 @@ class CiPlanTests(unittest.TestCase):
             plan["starry_matrix"]["include"][0]["command"],
             "cargo xtask starry test board --test-case native-hardware-smoke "
             "--board orangepi-5-plus",
+        )
+
+    def test_cpu_vmx_suite_routes_to_the_registered_cpu_case(self) -> None:
+        path = "test-suit/arceos/cpu/guest-entry/qemu-x86_64-vmx.toml"
+        context = ci_plan.PlanContext(
+            repository="rcore-os/tgoskits",
+            repository_owner="rcore-os",
+            event_name="pull_request",
+            base_ref="dev",
+            impact=ci_plan.CiImpact(
+                full=False,
+                reason="fixture",
+                changed_paths=(path,),
+                test_suite_paths=(path,),
+                exclusive=True,
+            ),
+        )
+        plan = ci_plan.build_main_plan(context)
+        rows = plan["arceos_matrix"]["include"]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("intel", rows[0]["runs_on"])
+        self.assertEqual(
+            rows[0]["command"],
+            "cargo xtask arceos test qemu --arch x86_64 "
+            "--test-group cpu --test-case guest-entry-vmx",
+        )
+
+    def test_cpu_pmu_board_routes_to_its_actual_case(self) -> None:
+        path = "test-suit/arceos/board-orangepi-5-plus/pmu/board-orangepi-5-plus.toml"
+        context = ci_plan.PlanContext(
+            repository="rcore-os/tgoskits",
+            repository_owner="rcore-os",
+            event_name="pull_request",
+            base_ref="dev",
+            impact=ci_plan.CiImpact(
+                full=False,
+                reason="fixture",
+                changed_paths=(path,),
+                test_suite_paths=(path,),
+                exclusive=True,
+            ),
+        )
+        plan = ci_plan.build_main_plan(context)
+        rows = plan["arceos_matrix"]["include"]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("board", rows[0]["runs_on"])
+        self.assertEqual(
+            rows[0]["command"],
+            "cargo xtask arceos test board --test-case pmu --board orangepi-5-plus",
         )
 
     def test_unregistered_test_suite_fails_planning(self) -> None:
@@ -484,30 +667,6 @@ command = "true"
         self.assertEqual(plan["arceos_matrix"]["include"], [])
         self.assertEqual(plan["axvisor_matrix"]["include"], [])
 
-    def test_arceos_qemu_jobs_run_same_arch_axtests_serially(self) -> None:
-        plan = ci_plan.build_main_plan(self.upstream)
-        rows = {row["id"]: row for row in plan["arceos_matrix"]["include"]}
-        expected_arches = {
-            "test-arceos-x86-64-qemu": "x86_64",
-            "test-arceos-riscv64-qemu": "riscv64",
-            "test-arceos-aarch64-qemu-app-suites": "aarch64",
-            "test-arceos-loongarch64-qemu": "loongarch64",
-        }
-
-        for check_id, arch in expected_arches.items():
-            command = rows[check_id]["command"]
-            arceos_command = f"cargo xtask arceos test qemu --arch {arch}"
-            axtest_command = (
-                "cargo xtask ktest qemu --workspace --exclude starry-kernel "
-                f"--exclude axvisor --arch {arch}"
-            )
-            self.assertIn(arceos_command, command)
-            self.assertIn(axtest_command, command)
-            self.assertLess(
-                command.index(arceos_command), command.index(axtest_command)
-            )
-            self.assertEqual(rows[check_id]["cache_key"], "")
-
     def test_fork_repository_filters_owner_checks_and_falls_back_from_qcs(
         self,
     ) -> None:
@@ -525,7 +684,7 @@ command = "true"
                 "run-clippy",
                 "test-with-std",
                 "test-arceos-aarch64-qemu-app-suites",
-                "test-axvisor-aarch64-qemu-http-control-plane",
+                "test-axvisor-aarch64-qemu-http-control-plane-browser-console-ivc",
                 "test-starry-aarch64-qemu",
             }.issubset(test_rows)
         )
@@ -544,69 +703,25 @@ command = "true"
         self.assertFalse(static_rows["check-formatting"]["download_xtask_bin_artifact"])
         clippy = test_rows["run-clippy"]
         self.assertEqual(clippy["runs_on"], ["ubuntu-latest"])
-        self.assertEqual(clippy["fetch_depth"], "0")
+        self.assertEqual(clippy["fetch_depth"], "100")
         self.assertTrue(clippy["download_xtask_bin_artifact"])
 
-    def test_starry_apps_schedule_and_manual_selection(self) -> None:
-        manual = ci_plan.PlanContext(
-            repository="rcore-os/tgoskits",
-            repository_owner="rcore-os",
-            event_name="workflow_dispatch",
-        )
-        manual_with_clippy = ci_plan.PlanContext(
-            repository="rcore-os/tgoskits",
-            repository_owner="rcore-os",
-            event_name="workflow_dispatch",
-            enabled_boolean_inputs=frozenset({"run_clippy_all"}),
-        )
-        scheduled = ci_plan.PlanContext(
-            repository="rcore-os/tgoskits",
-            repository_owner="rcore-os",
-            event_name="schedule",
-        )
-
-        manual_rows = self.assert_unique_ids(
-            ci_plan.build_starry_apps_plan(manual)["starry_apps_matrix"]["include"]
-        )
-        manual_with_clippy_rows = self.assert_unique_ids(
-            ci_plan.build_starry_apps_plan(manual_with_clippy)["starry_apps_matrix"][
-                "include"
-            ]
-        )
-        scheduled_rows = self.assert_unique_ids(
-            ci_plan.build_starry_apps_plan(scheduled)["starry_apps_matrix"]["include"]
-        )
-        required_ids = {
-            "starry-app-smoke-x86-64",
-            "starry-app-smoke-aarch64",
-            "starry-app-smoke-riscv64",
-            "starry-app-smoke-loongarch64",
-            "starry-nixos-x86-64-qemu",
-        }
-        for name, rows, expects_clippy in (
-            ("manual", manual_rows, False),
-            ("manual with clippy", manual_with_clippy_rows, True),
-            ("scheduled", scheduled_rows, True),
+    def test_event_and_boolean_input_select_checks_independently(self) -> None:
+        check = {"events": ["schedule"], "enable_boolean_input": "run_optional"}
+        for event, enabled, expected in (
+            ("schedule", frozenset(), True),
+            ("workflow_dispatch", frozenset(), False),
+            ("workflow_dispatch", frozenset({"run_optional"}), True),
+            ("workflow_dispatch", frozenset({"other_input"}), False),
         ):
-            with self.subTest(selection=name):
-                self.assertTrue(required_ids.issubset(rows))
-                self.assertEqual("starry-apps-clippy-all" in rows, expects_clippy)
-
-    def test_starry_apps_manual_nixos_uses_app_runner(self) -> None:
-        manual = ci_plan.PlanContext(
-            repository="rcore-os/tgoskits",
-            repository_owner="rcore-os",
-            event_name="workflow_dispatch",
-        )
-
-        rows = ci_plan.build_starry_apps_plan(manual)["starry_apps_matrix"]["include"]
-        rows_by_id = {row["id"]: row for row in rows}
-
-        nixos = rows_by_id["starry-nixos-x86-64-qemu"]
-        self.assertEqual(nixos["container_image"], "")
-        self.assertEqual(nixos["timeout_minutes"], 45)
-        self.assertIn("starry app qemu -t nixos", nixos["command"])
-        self.assertNotIn("starry test", nixos["command"])
+            with self.subTest(event=event, enabled=enabled):
+                context = ci_plan.PlanContext(
+                    repository="example/project",
+                    repository_owner="example",
+                    event_name=event,
+                    enabled_boolean_inputs=enabled,
+                )
+                self.assertEqual(ci_plan._is_enabled(check, context), expected)
 
     def assert_unique_ids(
         self, rows: list[dict[str, Any]]

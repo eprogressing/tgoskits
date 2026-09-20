@@ -8,6 +8,8 @@
 #![allow(clippy::new_ret_no_self)]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate ax_runtime;
 
 #[macro_use]
 extern crate log;
@@ -29,17 +31,7 @@ pub mod os;
 pub mod root;
 pub mod volume;
 
-/// White-box checks used only by the Cargo axtest integration target.
-#[cfg(all(axtest, feature = "axtest"))]
-#[doc(hidden)]
-pub mod axtest_support {
-    /// Checks block-IRQ outcomes and readiness conversion.
-    pub fn block_irq_outcome_and_ready_hold_for_test() -> bool {
-        super::os::block_irq_outcome_and_ready_hold_for_test()
-    }
-}
-
-#[cfg(feature = "fat")]
+#[cfg(any(feature = "ext4", feature = "fat"))]
 pub(crate) use error::block_error_to_vfs_error;
 pub use error::{BlockError, BlockResult};
 pub(crate) use error::{io_error_to_vfs_error, vfs_error_to_io_error};
@@ -51,6 +43,8 @@ fn register_mounted_filesystem(fs: Filesystem) {
     MOUNTED_FILESYSTEMS.lock().push(fs);
 }
 
+#[cfg(any(feature = "ext4", feature = "fat"))]
+pub use block::sync_all_block_caches;
 pub use block::{
     BlockRegion,
     runtime::{
@@ -62,6 +56,9 @@ pub use block::{
 pub use highlevel::*;
 #[cfg(feature = "vfs")]
 pub mod vfs {
+    /// Create an ext4 filesystem from an owned file source and its open lease.
+    #[cfg(feature = "ext4")]
+    pub use crate::fs::new_from_file as new_filesystem_from_file;
     /// Create a filesystem from a native block runtime handle.
     #[cfg(any(feature = "ext4", feature = "fat"))]
     pub use crate::fs::new_from_handle as new_filesystem_from_handle;

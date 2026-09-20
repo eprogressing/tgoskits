@@ -8,16 +8,18 @@ use ax_std::os::arceos::modules::ax_runtime::console::{
     self, ConsoleLogDropReport, ConsoleLogRecord, ConsoleLogSubscription, TaskConsoleInput,
     TaskConsoleOutput,
 };
-use ax_std::os::arceos::{
-    modules::{
-        ax_runtime::{RuntimeError, RuntimeResult, emergency_console},
-        ax_task::IrqNotify,
-    },
-    sync::NoPreemptMutex,
-};
 use std::sync::{Mutex, OnceLock};
+use {
+    ax_std::os::arceos::modules::ax_runtime::RuntimeError,
+    ax_std::os::arceos::modules::ax_runtime::RuntimeResult,
+    ax_std::os::arceos::modules::ax_runtime::emergency_console,
+    ax_std::os::arceos::modules::ax_runtime::irq::FixedIrqWorkerSignal,
+    ax_std::os::arceos::sync::NoPreemptMutex,
+};
 
 use axvisor::console_mux::HostOutputQueue;
+
+use super::terminal::TerminalNewlineNormalizer;
 
 const HOST_OUTPUT_QUEUE_CAPACITY: usize = 64 * 1024;
 const HOST_OUTPUT_BATCH_CAPACITY: usize = 512;
@@ -25,13 +27,11 @@ const HOST_OUTPUT_BATCH_CAPACITY: usize = 512;
 struct HostConsole {
     input: Option<TaskConsoleInput>,
     logs: Option<ConsoleLogSubscription>,
-    #[cfg(feature = "test-console-atomic-output")]
-    test_output: TaskConsoleOutput,
 }
 
 struct HostOutput {
     queue: NoPreemptMutex<HostOutputQueue<HOST_OUTPUT_QUEUE_CAPACITY>>,
-    ready: IrqNotify,
+    ready: FixedIrqWorkerSignal,
     failed: AtomicBool,
 }
 
@@ -69,12 +69,7 @@ pub(crate) fn configure_host_console() -> Result<()> {
         Err(error) => return Err(error).context("failed to take host console input"),
     };
     let output = console::output().context("failed to open host console output")?;
-    let host_console = HostConsole {
-        input,
-        logs,
-        #[cfg(feature = "test-console-atomic-output")]
-        test_output: output.clone(),
-    };
+    let host_console = HostConsole { input, logs };
     std::thread::Builder::new()
         .name("axvisor-console-output".into())
         .spawn(move || run_host_output_worker(output))
@@ -104,16 +99,29 @@ pub(crate) fn read_host_byte() -> Option<u8> {
 }
 
 pub(crate) fn read_host_log() -> Option<ConsoleLogRecord> {
-    host_console()?.logs.as_ref()?.try_read()
+    host_log_subscription()?.try_read()
+}
+
+/// Returns false only when this console has no ordered record subscription.
+pub(crate) fn queue_guest_output(tag: u128, bytes: &[u8]) -> bool {
+    let Some(logs) = host_log_subscription() else {
+        return false;
+    };
+    // Queue overflow is reported by the sole subscriber, never through guest
+    // UART bytes or recursive logging from an atomic callback.
+    let _ = logs.write_output(tag, bytes);
+    true
 }
 
 pub(crate) fn take_host_log_drops() -> ConsoleLogDropReport {
-    host_console()
-        .and_then(|console| console.logs.as_ref())
-        .map_or_else(
-            ConsoleLogDropReport::default,
-            ConsoleLogSubscription::dropped,
-        )
+    host_log_subscription().map_or_else(
+        ConsoleLogDropReport::default,
+        ConsoleLogSubscription::dropped,
+    )
+}
+
+fn host_log_subscription() -> Option<&'static ConsoleLogSubscription> {
+    host_console()?.logs.as_ref()
 }
 
 /// Sleeps until physical input or a host log record is published.
@@ -122,7 +130,8 @@ pub(crate) fn wait_for_host_event() {
     let Some(console) = host_console() else {
         park_console_task();
     };
-    let result = match (&console.input, &console.logs) {
+    let logs = host_log_subscription();
+    let result = match (&console.input, logs) {
         (Some(input), Some(logs)) => input.wait_event(logs),
         (Some(input), None) => input.wait_readable(),
         (None, Some(logs)) => logs.wait_readable(),
@@ -135,8 +144,8 @@ pub(crate) fn wait_for_host_event() {
 }
 
 fn park_console_task() -> ! {
-    static STOPPED: ax_std::os::arceos::modules::ax_task::WaitQueue =
-        ax_std::os::arceos::modules::ax_task::WaitQueue::new();
+    static STOPPED: ax_std::os::arceos::modules::ax_task::sync::WaitQueue =
+        ax_std::os::arceos::modules::ax_task::sync::WaitQueue::new();
     loop {
         STOPPED.wait();
     }
@@ -162,8 +171,15 @@ pub(crate) fn submit_host_transaction(transaction: impl FnOnce(&mut dyn FnMut(&[
 }
 
 fn run_host_output_worker(output: TaskConsoleOutput) {
+    let mut terminal = TerminalNewlineNormalizer::new();
     loop {
-        HOST_OUTPUT.ready.wait();
+        if let Err(error) = HOST_OUTPUT.ready.wait() {
+            HOST_OUTPUT.failed.store(true, Ordering::Release);
+            let _ = emergency_console::write_fmt(format_args!(
+                "\nAxvisor host console output worker stopped: {error}\n"
+            ));
+            return;
+        }
         if HOST_OUTPUT.failed.load(Ordering::Acquire) {
             return;
         }
@@ -172,10 +188,10 @@ fn run_host_output_worker(output: TaskConsoleOutput) {
             if batch.is_empty() {
                 break;
             }
-            if let Err(error) = write_host_output_batch(&output, &batch) {
+            if let Err(error) = write_host_output_batch(&output, &mut terminal, &batch) {
                 HOST_OUTPUT.failed.store(true, Ordering::Release);
                 let _ = emergency_console::write_fmt(format_args!(
-                    "\nAxvisor host console output stopped: {error}\n"
+                    "\r\nAxvisor host console output stopped: {error}\r\n"
                 ));
                 return;
             }
@@ -183,23 +199,30 @@ fn run_host_output_worker(output: TaskConsoleOutput) {
     }
 }
 
-fn write_host_output_batch(output: &TaskConsoleOutput, batch: &HostOutputBatch) -> RuntimeResult {
+fn write_host_output_batch(
+    output: &TaskConsoleOutput,
+    terminal: &mut TerminalNewlineNormalizer,
+    batch: &HostOutputBatch,
+) -> RuntimeResult {
     if batch.dropped_bytes != 0 {
         let report = format!(
             "\n[Axvisor host console dropped {} queued bytes]\n",
             batch.dropped_bytes
         );
-        output.write_all(report.as_bytes())?;
+        terminal.write(report.as_bytes(), |bytes| {
+            output.write_all(bytes).map(|_| ())
+        })?;
     }
-    output.write_all(&batch.bytes[..batch.len])?;
-    Ok(())
+    terminal.write(&batch.bytes[..batch.len], |bytes| {
+        output.write_all(bytes).map(|_| ())
+    })
 }
 
 impl HostOutput {
     const fn new() -> Self {
         Self {
             queue: NoPreemptMutex::new(HostOutputQueue::new()),
-            ready: IrqNotify::new(),
+            ready: FixedIrqWorkerSignal::new(),
             failed: AtomicBool::new(false),
         }
     }
@@ -231,7 +254,7 @@ impl HostOutput {
         drop(transaction_queue);
         drop(queue);
         if submitted {
-            self.ready.notify_irq();
+            self.ready.notify();
         }
     }
 
@@ -252,31 +275,4 @@ impl HostOutputBatch {
     fn is_empty(&self) -> bool {
         self.len == 0 && self.dropped_bytes == 0
     }
-}
-
-#[cfg(feature = "test-console-atomic-output")]
-/// Fills the bounded runtime ingress while the single owner CPU is held under
-/// `PreemptGuard`.
-pub(crate) fn fill_runtime_output_queue() {
-    static FRAME: [u8; 256] = [b'x'; 256];
-    const MAX_EXPECTED_RUNTIME_INGRESS: usize = 64 * 1024;
-
-    assert_eq!(
-        ax_std::os::arceos::modules::ax_hal::cpu_num(),
-        1,
-        "atomic-output regression requires the runtime owner and test on one CPU"
-    );
-    let mut accepted = 0;
-    while accepted <= MAX_EXPECTED_RUNTIME_INGRESS {
-        match host_console()
-            .expect("host console must be configured before running the regression")
-            .test_output
-            .try_write(&FRAME)
-        {
-            Ok(written) => accepted += written,
-            Err(RuntimeError::WouldBlock) => return,
-            Err(error) => panic!("failed to fill runtime output queue: {error}"),
-        }
-    }
-    panic!("runtime output accepted more than its bounded ingress contract");
 }

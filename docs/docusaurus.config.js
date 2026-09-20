@@ -5,10 +5,12 @@ const routes = {
   quickstart: '/docs/quickstart/overview',
   architecture: '/docs/architecture/overview',
   build: '/docs/build/overview',
-  guideline: '/guideline/code-quality',
   arceos: '/docs/quickstart/arceos',
   starryos: '/docs/quickstart/starryos',
   axvisor: '/docs/quickstart/axvisor',
+  oss: '/oss',
+  components: '/components',
+  apps: '/apps',
   blog: '/blog',
   community: '/community/introduction',
   github: 'https://github.com/rcore-os/tgoskits',
@@ -34,6 +36,7 @@ const config = {
   },
   themes: ['@docusaurus/theme-mermaid'],
   plugins: [
+    './plugins/catalog',
     [
       '@docusaurus/plugin-content-docs',
       {
@@ -42,18 +45,6 @@ const config = {
         routeBasePath: 'community',
         sidebarPath: './sidebars.community.js',
         editUrl: 'https://github.com/rcore-os/tgoskits/tree/main/docs/community',
-        showLastUpdateAuthor: true,
-        showLastUpdateTime: true,
-      },
-    ],
-    [
-      '@docusaurus/plugin-content-docs',
-      {
-        id: 'guideline',
-        path: 'guideline',
-        routeBasePath: 'guideline',
-        sidebarPath: './sidebars.guideline.js',
-        editUrl: 'https://github.com/rcore-os/tgoskits/tree/main/docs/guideline',
         showLastUpdateAuthor: true,
         showLastUpdateTime: true,
       },
@@ -129,17 +120,14 @@ const config = {
         src: 'images/site/logo.svg',
       },
       items: [
+        {to: routes.components, activeBasePath: 'components', label: 'Components', position: 'left'},
+        {to: routes.oss, activeBasePath: 'oss', label: 'OSs', position: 'left'},
+        {to: routes.apps, activeBasePath: 'apps', label: 'Showcase', position: 'left'},
         {
           type: 'docSidebar',
           sidebarId: 'docs',
           position: 'left',
-          label: 'Document',
-        },
-        {
-          to: routes.guideline,
-          activeBasePath: 'guideline',
-          position: 'left',
-          label: 'Guideline',
+          label: 'Documents',
         },
         {
           to: routes.blog,
@@ -170,12 +158,12 @@ const config = {
             {label: '快速开始', to: routes.quickstart},
             {label: '架构设计', to: routes.architecture},
             {label: '构建与运行', to: routes.build},
-            {label: '工程规范', to: routes.guideline},
           ],
         },
         {
           title: '系统',
           items: [
+            {label: 'OSs 总览', to: routes.oss},
             {label: 'ArceOS', to: routes.arceos},
             {label: 'StarryOS', to: routes.starryos},
             {label: 'Axvisor', to: routes.axvisor},
@@ -187,7 +175,8 @@ const config = {
             {label: 'GitHub 仓库', href: routes.github},
             {label: '构建系统', to: routes.build},
             {label: '架构设计', to: routes.architecture},
-            {label: '工程规范', to: routes.guideline},
+            {label: 'Components', to: routes.components},
+            {label: 'Showcase', to: routes.apps},
             {label: 'Blog', to: routes.blog},
             {label: 'Community', to: routes.community},
           ],

@@ -7,6 +7,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/rcore-os/tgoskits/compare/starry-kernel-v0.10.2...starry-kernel-v0.11.0) - 2026-09-18
+
+### Added
+
+- *(vfs)* implement mutation credentials for directory operations an… ([#2287](https://github.com/rcore-os/tgoskits/pull/2287))
+
+### Fixed
+
+- *(ax-fs-ng)* serialize page-cache eviction with mapping publication ([#2449](https://github.com/rcore-os/tgoskits/pull/2449))
+- *(ci)* restore RK3588 NPU inference and require complete workload success ([#2441](https://github.com/rcore-os/tgoskits/pull/2441))
+- *(starry-kernel)* preserve ptrace stops during ordinary signal wakeups ([#2434](https://github.com/rcore-os/tgoskits/pull/2434))
+- *(rknpu)* enforce per-owner and per-device GEM allocation quotas ([#2424](https://github.com/rcore-os/tgoskits/pull/2424))
+- *(cvi-vdec)* convert native JPEG chroma to YUV420 ([#2414](https://github.com/rcore-os/tgoskits/pull/2414))
+- *(starry-kernel)* forward terminal cursor position queries ([#2408](https://github.com/rcore-os/tgoskits/pull/2408))
+- *(starry-kernel)* unify inode lock identity across mounts ([#2406](https://github.com/rcore-os/tgoskits/pull/2406))
+- *(starry-kernel)* enforce executable inode write exclusion ([#2375](https://github.com/rcore-os/tgoskits/pull/2375))
+- *(starry-kernel)* make FIFO opens interruptible ([#2368](https://github.com/rcore-os/tgoskits/pull/2368))
+- *(ci)* fix debugfs test execution and virtio input startup ([#2396](https://github.com/rcore-os/tgoskits/pull/2396))
+- *(starry)* align syscall and Unix socket semantics with Linux ([#2270](https://github.com/rcore-os/tgoskits/pull/2270))
+
+### Other
+
+- *(starry)* simplify feature selection ([#2436](https://github.com/rcore-os/tgoskits/pull/2436))
+- *(scheduler)* streamline wakeup paths and RT accounting ([#2435](https://github.com/rcore-os/tgoskits/pull/2435))
+- *(sched)* reduce scheduler and futex hot-path overhead ([#2399](https://github.com/rcore-os/tgoskits/pull/2399))
+
+### Changed
+
+- [**breaking**] 移除 `starry-kernel` 的 `input`、`smp`、`vsock` 和 `ipi` Cargo features；对应内核路径改为始终编译。
+
+## [0.10.2](https://github.com/rcore-os/tgoskits/compare/starry-kernel-v0.10.1...starry-kernel-v0.10.2) - 2026-09-13
+
+### Added
+
+- *(starry)* add AArch64 Linux perf support ([#2274](https://github.com/rcore-os/tgoskits/pull/2274))
+
+### Fixed
+
+- *(rknpu)* copy and validate user task arrays before NPU submit ([#2327](https://github.com/rcore-os/tgoskits/pull/2327))
+
+### Other
+
+- *(rdrive)* bind device borrows to guard lifetimes ([#2387](https://github.com/rcore-os/tgoskits/pull/2387))
+
+## [0.10.1](https://github.com/rcore-os/tgoskits/compare/starry-kernel-v0.10.0...starry-kernel-v0.10.1) - 2026-09-12
+
+### Fixed
+
+- *(starry-kernel)* scope setns and id-map privileges to the initial user namespace. ([#2266](https://github.com/rcore-os/tgoskits/pull/2266))
+
+## [0.10.0](https://github.com/rcore-os/tgoskits/compare/starry-kernel-v0.9.0...starry-kernel-v0.10.0) - 2026-09-11
+
+### Added
+
+- *(ax-fs-ng)* add async block request runtime ([#2349](https://github.com/rcore-os/tgoskits/pull/2349))
+
+### Fixed
+
+- *(starry-kernel)* bound pipe writev copies and preserve partial writes ([#2372](https://github.com/rcore-os/tgoskits/pull/2372))
+- *(rknpu)* add timeout error handling and update ioctl error mapping ([#2324](https://github.com/rcore-os/tgoskits/pull/2324))
+
+### Other
+
+- *(starry)* migrate linkat checks and honor absolute destination dirfd ([#2376](https://github.com/rcore-os/tgoskits/pull/2376))
+- *(ax-task)* unify thread lifecycle and PREEMPT_RT lock semantics ([#2357](https://github.com/rcore-os/tgoskits/pull/2357))
+- *(ax-cpu)* [**breaking**] centralize CPU mechanisms and architecture backends ([#2363](https://github.com/rcore-os/tgoskits/pull/2363))
+- *(axbuild)* migrate test execution to shell check steps ([#2361](https://github.com/rcore-os/tgoskits/pull/2361))
+
+## [0.9.0](https://github.com/rcore-os/tgoskits/compare/starry-kernel-v0.8.3...starry-kernel-v0.9.0) - 2026-09-09
+
+### Added
+
+- *(starry-mm)* redesign VMA lifecycle and transactional updates ([#2261](https://github.com/rcore-os/tgoskits/pull/2261))
+- feat(StarryOS)：Enhance axivc IVC char devices and improve ioctl handling ([#2214](https://github.com/rcore-os/tgoskits/pull/2214))
+- *(aic8800)* integrate AKA WPA2 Wi-Fi and iperf validation ([#2222](https://github.com/rcore-os/tgoskits/pull/2222))
+
+### Fixed
+
+- *(axfs-ng-vfs)* validate admitted unmounts by affected topology ([#2321](https://github.com/rcore-os/tgoskits/pull/2321))
+- *(jpeg)* validate MPP DMA ranges against imported dma-bufs ([#2289](https://github.com/rcore-os/tgoskits/pull/2289))
+- *(starry-kernel)* limit clippy to package features ([#2312](https://github.com/rcore-os/tgoskits/pull/2312))
+- *(starry-kernel)* support setting the realtime clock ([#2237](https://github.com/rcore-os/tgoskits/pull/2237))
+- *(starry-kernel)* report times(2) in USER_HZ clock ticks ([#2263](https://github.com/rcore-os/tgoskits/pull/2263))
+- *(starry-kernel)* report an enabled CPUID from arch_prctl(ARCH_GET_CPUID) ([#2259](https://github.com/rcore-os/tgoskits/pull/2259))
+- *(starry-kernel)* stop select() reporting a hung-up fd as writable ([#2260](https://github.com/rcore-os/tgoskits/pull/2260))
+- *(starry)* enforce warning-free builds ([#2244](https://github.com/rcore-os/tgoskits/pull/2244))
+- *(starry-kernel)* avoid filesystem teardown in reboot syscall ([#2220](https://github.com/rcore-os/tgoskits/pull/2220))
+
+### Other
+
+- *(repo)* remove duplicated tests and configuration snapshots ([#2326](https://github.com/rcore-os/tgoskits/pull/2326))
+- *(ax-task)* [**breaking**] organize scheduler namespaces and unify runtime APIs ([#2313](https://github.com/rcore-os/tgoskits/pull/2313))
+- *(starry-kernel)* scope VMA and epoll scans to what each caller needs ([#2302](https://github.com/rcore-os/tgoskits/pull/2302))
+- *(repo)* continue removing nonfunctional test scaffolding ([#2307](https://github.com/rcore-os/tgoskits/pull/2307))
+- *(ax-task)* rebuild scheduler and runtime ownership ([#1775](https://github.com/rcore-os/tgoskits/pull/1775))
+- *(repo)* remove nonfunctional test scaffolding ([#2303](https://github.com/rcore-os/tgoskits/pull/2303))
+- *(ci)* update Rust nightly to 2026-09-04 ([#2273](https://github.com/rcore-os/tgoskits/pull/2273))
+- *(rsext4)* [**breaking**] align ext4 semantics with Linux 7.1 ([#1957](https://github.com/rcore-os/tgoskits/pull/1957))
+
+### Added
+
+- Implement ext4 data and xattr `FS_IOC_FIEMAP`, persistent inode-owned xattrs,
+  and typed ext4 fallocate operations for preallocation, zero/punch,
+  collapse-range, and insert-range.
+
+### Changed
+
+- Remove the `loongarch64-low-va` board feature. Each new Starry user MM now
+  captures a typed layout clipped to the platform's runtime canonical lower
+  half.
+
+### Fixed
+
+- Publish tmpfs/overlay symlinks atomically with their final targets and keep
+  directory positions on Linux-compatible opaque ext4 cursors.
+
+## [0.8.3](https://github.com/rcore-os/tgoskits/compare/starry-kernel-v0.8.2...starry-kernel-v0.8.3) - 2026-08-27
+
+### Added
+
+- *(ax-fs-ng)* add shared block cache between block and filesystem layers ([#2171](https://github.com/rcore-os/tgoskits/pull/2171))
+
+### Other
+
+- *(runtime)* make IRQ and multitasking mandatory ([#2188](https://github.com/rcore-os/tgoskits/pull/2188))
+- *(ax-net)* add queue-level NAPI runtime ([#2178](https://github.com/rcore-os/tgoskits/pull/2178))
+
+## [0.8.2](https://github.com/rcore-os/tgoskits/compare/starry-kernel-v0.8.1...starry-kernel-v0.8.2) - 2026-08-25
+
+### Fixed
+
+- *(ax-driver)* attribute RK3588 governor busy by FDT cpu topology ([#2165](https://github.com/rcore-os/tgoskits/pull/2165))
+
+### Other
+
+- *(test)* consolidate Starry and ArceOS test suites ([#2173](https://github.com/rcore-os/tgoskits/pull/2173))
+
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/starry-kernel-v0.8.0...starry-kernel-v0.8.1) - 2026-08-25
+
+### Added
+
+- *(ax-cgroup)* expose pids.peak ([#2091](https://github.com/rcore-os/tgoskits/pull/2091))
+
+### Fixed
+
+- *(starry)* honor getgroups signed-size ABI ([#2056](https://github.com/rcore-os/tgoskits/pull/2056))
+- *(starry)* preserve ptrace request width ([#2054](https://github.com/rcore-os/tgoskits/pull/2054))
+- *(starry)* honor personality unsigned-int ABI ([#2055](https://github.com/rcore-os/tgoskits/pull/2055))
+- *(starry-kernel)* bound shebang interpreter recursion ([#2032](https://github.com/rcore-os/tgoskits/pull/2032))
+- *(runtime)* prevent QEMU timer and exec stalls ([#2130](https://github.com/rcore-os/tgoskits/pull/2130))
+- *(starry-kernel)* roll back failed COW clones ([#2096](https://github.com/rcore-os/tgoskits/pull/2096))
+
 ## [0.8.0](https://github.com/rcore-os/tgoskits/compare/starry-kernel-v0.7.7...starry-kernel-v0.8.0) - 2026-08-20
 
 ### Added

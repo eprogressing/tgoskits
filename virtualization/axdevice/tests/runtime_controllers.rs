@@ -1,3 +1,5 @@
+extern crate ax_runtime as _;
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -123,6 +125,10 @@ impl DeviceModel for IrqFactory {
             ResourceRequest::Fixed(ControllerInputId::new(40)),
         )?;
         Ok(requirements)
+    }
+
+    fn firmware(&self) -> DeviceFirmwareSpec {
+        DeviceFirmwareSpec::None
     }
 
     fn build(

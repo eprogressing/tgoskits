@@ -5,7 +5,7 @@ sidebar_label: "客户机控制台"
 
 # Axvisor 客户机控制台架构
 
-Axvisor 只有一个物理宿主控制台，但管理 shell 和多台客户机都需要收发字符。这个共享边界由 Axvisor 应用层的 `GuestConsoleMux` 管理：它是宿主输入的唯一读取者，决定当前前台，把输入送进对应 VM 的有界队列，并在多个客户机写同一个终端时完成输出仲裁。虚拟 UART 只通过 `SerialBackend` 读写字节，不拥有前台、快捷键或宿主终端策略。
+Axvisor 只有一个物理宿主控制台，但管理 shell 和多台客户机都需要收发字符。这个共享边界由 Axvisor 应用层的 `GuestConsoleMux` 管理：它是物理宿主输入的唯一读取者，决定当前前台，把输入送进对应 VM 的有界队列，并在多个客户机写同一个物理终端时完成输出仲裁。可选的 `browser-console` 传输还可以把管理 shell 和启动时成功注册的最多三个 VM 映射到独立 WebSocket 字节流，而不改变物理 UART 前台。虚拟 UART 只通过 `SerialBackend` 读写字节，不拥有前台、快捷键或宿主终端策略。
 
 本文说明应用层的输入 ownership、前台状态、backend generation 有效性、输出模式和 VM 生命周期接入。UART 寄存器、FIFO、IRQ endpoint 与 vCPU poll 的完整语义见[设备运行时与中断架构](./device-runtime.md#5-串口完整路径)。
 
@@ -20,6 +20,7 @@ Axvisor 只有一个物理宿主控制台，但管理 shell 和多台客户机�
 | `GuestSerialBackendFactory` / `GuestSerialBackend` | factory 为一个 host-console serial request 创建带 `(VMId, BackendGeneration)` 身份的 backend；backend 把设备层字节调用转入 mux | configured node 创建；UART runtime 读写 |
 | `GuestOutputMux` | 在 `BootMultiplex` 与 `Interactive` 间切换，补齐物理行，维护每 VM 16 KiB 环形输出，并生成回放 | 客户机输出与前台变化 |
 | `guest_console/host.rs` | 在 vCPU 启动前取得唯一的 task-console RX、日志订阅与 output；output 移交给专用任务，其他路径只向固定队列提交事务 | Axvisor 初始化与 shell 主循环 |
+| `network_console` | 私有保存启动快照、四条固定容量通道、独占网页会话和 Axvisor 网页行编辑；不提供 raw TCP listener | `browser-console` 功能启用时 |
 | `shell/mod.rs` | 作为输入事件循环的唯一 owner，消费 `ConsoleInputEvent`，调用 `activate()`，每轮 reconcile VM 状态 | 管理 shell |
 | `shell/command/vm.rs` | `vm start --console`、`vm console` 以及 start/stop/reset/resume/delete 的 mux lifecycle 调用 | 管理命令 |
 | `AxvmManager` 接入 | 提供 VM registry/status，输入入队后唤醒 VM；实际设备 poll 由 vCPU0 执行 | VM lifecycle 与运行期 |
@@ -28,7 +29,8 @@ Axvisor 只有一个物理宿主控制台，但管理 shell 和多台客户机�
 `NoPreemptMutex`：`state` 保护以上全部可变状态，`output_lock` 串行化输出仲裁以及 backend
 replacement/invalidation。客户机输出路径的固定顺序是 `output_lock` → host transport queue →
 `state`；它只格式化并提交一个固定容量事务，不触碰物理 UART。其他同时使用两把 mux 锁的
-路径仍按 `output_lock` → `state` 加锁，禁止反向获取。
+路径仍按 `output_lock` → `state` 加锁，禁止反向获取。网络分支不同时持有这两把锁：它先在
+`state` 下校验 generation，释放后才向对应的固定网络队列复制原始字节。
 
 ## 2. 初始化与宿主输入 ownership
 
@@ -66,7 +68,7 @@ flowchart LR
 形成两个 reader 拆分输入流。
 
 日志订阅只在完整 record 边界切换。shell 未附着 guest 时，mux 先清除当前编辑行、输出宿主
-日志，再重画 prompt、内容和光标；guest 位于前台时，宿主日志按完整记录进入 16 KiB 有界
+日志，再重画 prompt、内容和光标；guest 位于前台时，宿主日志按完整记录进入 2 MiB 有界
 backlog，返回管理 shell 后再回放。底层 64 条 record 队列和 mux backlog 的溢出都以摘要
 报告，不把宿主日志字节注入 guest 虚拟 UART。
 
@@ -85,7 +87,7 @@ backlog，返回管理 shell 后再回放。底层 64 条 record 队列和 mux b
 | `Ctrl+X Ctrl+X` | 前台不变 | 向当前 VM 发送一个 `Ctrl+X`；在 shell 中返回一个 `ShellByte(Ctrl+X)` |
 | `Ctrl+X` 后跟其他字节 | 前台不变 | 向当前 VM 原序发送两个字节；在 shell 中返回 `ShellSequence` |
 
-`running` 是按 VM ID 排序的 `BTreeSet`。启动期 `attach_default()` 选择最小 ID；快捷键切换以当前 `attached` 为锚，没有当前前台时以 `last_attached` 为锚，并在集合首尾环绕。两者都不存在时，`[` 从最大 ID 开始、`]` 从最小 ID 开始。集合为空则返回 `NoRunningGuest`，由 shell 打印诊断并重绘当前命令行。
+`running` 是按 VM ID 排序的 `BTreeSet`。默认启动不会选择前台 VM；快捷键切换以当前 `attached` 为锚，没有当前前台时以 `last_attached` 为锚，并在集合首尾环绕。两者都不存在时，`[` 从最大 ID 开始、`]` 从最小 ID 开始。集合为空则返回 `NoRunningGuest`，由 shell 打印诊断并重绘当前命令行。
 
 ### 3.1 有界输入与唤醒
 
@@ -93,11 +95,15 @@ backlog，返回管理 shell 后再回放。底层 64 条 record 队列和 mux b
 
 `route_host_byte()` 在持有 mux 锁时只完成状态修改和入队，把待唤醒的 VM ID 放进 `RoutedInput`。公共入口释放 `state` 和 `output_lock` 后才调用 `AxvmManager::notify_vm()`；唤醒失败只记录 warning，已入队字节仍保留。这个锁外调用避免 mux 锁跨入 VM manager 和 scheduler。
 
+`route_network_input(vm_id, bytes)` 复用同一有界队列和锁外唤醒，但它先要求目标
+VM 仍在 running 集合且存在当前 backend generation。该入口按 VM ID 直接路由，
+不取得物理 `TaskConsoleInput`、不解析 `Ctrl+X` 快捷键，也不改变 `attached`。
+
 ### 3.2 命令附着与 foreground 激活
 
-`vm console <VM_ID>` 和 `vm start --console <VM_ID>` 最终都调用 `guest_console::attach()`。它先从 manager 查找 VM，再要求 `VmStatus::Running`，随后把 VM 记入 running 集合并设置 `attached`；不存在或非 Running 都返回明确错误，不创建悬空前台。
+`vm console <VM_ID>` 和 `vm start --console <VM_ID>` 最终都调用 `guest_console::attach()`。它先从 manager 查找 VM。`Running` VM 被记入 running 集合并设置 `attached`；`Stopped` VM 则只在 `output_lock` 下 drain 仍保留的 ring，补齐未结束行，不设置前台也不接收输入。不存在、没有 console state，或处于 Ready/Paused/Stopping 等中间状态时返回明确错误。
 
-命令先打印“已附着”提示，再调用 `activate(vm_id)`。`activate()` 只有在该 VM 仍是当前前台时才把输出切到 `Interactive { foreground: Some(vm_id) }` 并回放缓存，因此 shell 提示与客户机历史输出不会颠倒。快捷键切换也由 shell 收到 `Attached` 事件、打印提示后调用同一入口。
+运行中 VM 的命令先打印“已附着”提示，再调用 `activate(vm_id)`。`activate()` 只有在该 VM 仍是当前前台时才把输出切到 `Interactive { foreground: Some(vm_id) }` 并回放缓存，因此 shell 提示与客户机历史输出不会颠倒。快捷键切换也由 shell 收到 `Attached` 事件、打印提示后调用同一入口。已停止 VM 的 replay 在 `attach()` 内完成，命令随后打印完成信息并由 shell 正常重画提示符。
 
 ## 4. Backend generation 的创建与有效性
 
@@ -147,7 +153,7 @@ backend 的读、写都带创建时的 `(vm_id, generation)`：
 
 - `read_guest_input()` 只在 `GuestState.backend_generation == generation` 时取队列，否则返回 0；
 - `format_guest_output()` 在修改 `GuestOutputMux` 之前做相同校验，stale 写返回 `None`，不会改变 pending、owner、mode 或物理行状态；
-- `mark_stopped(vm_id)` 显式把 generation 置空、清输入、清该 VM 输出，并从 running 移除；
+- `mark_stopped(vm_id)` 显式把 generation 置空、清输入并从 running 移除，但保留该 VM 的有界输出以供回放；
 - `remove(vm_id)` 删除整个 `GuestState`、running/last-attached 和输出状态。
 
 设备 runtime 的底层 stop、drop、reset 或 manager remove 不会自动调用这些应用接口。下一节列出了 Axvisor 应用层的实际调用路径。
@@ -158,19 +164,19 @@ backend 的读、写都带创建时的 `(vm_id, generation)`：
 
 | Axvisor 路径 | manager 操作成功后的 mux 调用 | generation / 输出 / foreground 结果 |
 | --- | --- | --- |
-| 默认自动启动 | `launch_default_vms()` 返回成功 ID，随后 `attach_default(started_vms)` | 重建 running 集合，进入 `BootMultiplex`，附着最小 ID 并请求其下一条完整行优先 |
+| 默认自动启动 | `launch_default_vms()`；shell 循环随后按实际状态对账 | 不选择 foreground；每台 VM 的输出保留在自己的有界 ring 中，等待显式附着 |
 | `vm start` | `mark_running(vm_id)` | 保留现有 generation；加入 running，不自动改变 foreground |
 | `vm start --console` | start 的 `mark_running`，再 `attach()`、打印提示、`activate()` | 切到目标并进入 Interactive，回放其 ring |
-| `vm console` | `attach()` 内部在 Running 检查后调用 `mark_running`，随后命令调用 `activate()` | 不改 generation；切 foreground 并回放 |
-| `vm stop` | shutdown request 成功后立即 `mark_stopped(vm_id)` | 请求发出即清 generation、输入和输出；若是前台则转为无 foreground，不等待最终 `Stopped` |
+| `vm console` | `attach()` 根据状态选择交互附着或停止后回放 | Running 时切 foreground；Stopped 时 drain ring 后留在 shell |
+| `vm stop` | shutdown request 成功后立即 `mark_stopped(vm_id)` | 请求发出即清 generation 和输入并保留输出；若是前台则转为无 foreground，不等待最终 `Stopped` |
 | `vm reset` | reset 完成且新 runtime 已 Running 后 `mark_running(vm_id)` | device plan 复用原 backend；generation 不变。该命令没有先调用 `mark_stopped` |
 | `vm resume` | resume 成功后 `mark_running(vm_id)` | 加入 running，generation 与 foreground 不变 |
 | `vm delete` | manager registry 成功移除后 `remove(vm_id)`，再调用 `vm.destroy()` | 删除所有 mux state；若是前台则返回 shell。destroy 失败不会恢复已删状态 |
-| guest 自行退出、deferred reset、HTTP 等非 shell 状态变化 | 没有直接 mux lifecycle hook；shell 循环调用 `reconcile_vm_states()` | 以 registry 中实际 `Running` 集合修正 running、输出集合和 foreground |
+| guest 自行退出、deferred reset、HTTP 等非 shell 状态变化 | 没有直接 mux lifecycle hook；shell 循环调用 `reconcile_vm_states()` | 以 registry 中实际 `Running` 集合修正 running 和 foreground；保留 generation、输入与输出 ring |
 
-`reconcile_vm_states()` 每轮读取 manager registry，只保留状态恰为 `Running` 的 ID。若当前前台不再运行，`set_running()` 清 `attached` 和快捷键前缀，调用 `buffer_all()` 补齐可能未完成的宿主物理行；shell 随后打印“VM stopped; returning to the management shell”并重绘提示符。非前台 VM 离开 Running 时，其 output ring 也由 `reconcile_running()` 丢弃。
+`reconcile_vm_states()` 每轮读取 manager registry，只把状态恰为 `Running` 的 ID 放入运行集合，并保留其他 VM 的 generation、输入与 output ring。若当前前台不再运行，`set_running()` 还会清 `attached` 和快捷键前缀，调用 `buffer_all()` 补齐可能未完成的宿主物理行；shell 随后打印“VM stopped; returning to the management shell”并重绘提示符。
 
-reconcile 不是 `mark_stopped()` 的别名：它不会清 `GuestState.backend_generation` 或输入队列，也不会删除 `GuestState`。因此只有明确经过 shell stop/delete 路径时，才能声称 generation 被 `mark_stopped`/`remove` 失效；其他路径目前主要依赖 VM 不再运行来停止设备访问，并由 shell 对账前台显示。
+reconcile 不是 `mark_stopped()` 的别名：它只按 manager 的完整 Running 集合对账 foreground，不失效 generation 或输入，避免 Paused 等非 Running 状态丢失可恢复 backend。两条路径都保留 bounded ring；只有 backend replacement 或 `remove()` 会明确删除旧输出。
 
 ## 6. 输出模式与行级仲裁
 
@@ -187,7 +193,7 @@ flowchart LR
     Lock["output_lock"]
     Valid{"generation current?"}
     Mode{"GuestOutputMux mode"}
-    Boot["BootMultiplex<br/>完整行 + 可选 [VM n]"]
+    Boot["显式 BootMultiplex<br/>完整行 + 可选 [VM n]"]
     Fore["Interactive foreground<br/>ring replay + direct output"]
     Back["Interactive background / detached<br/>16 KiB ring"]
     Queue["HostOutputTransaction<br/>固定队列，整事务提交或回滚"]
@@ -206,15 +212,15 @@ flowchart LR
     Queue --> Worker --> Host
 ```
 
-### 6.1 `BootMultiplex`
+### 6.1 缓存启动输出
 
-启动期需要同时观察多个 VM。只有一个 running VM 时，pending 字节立即输出且不加前缀。多个 VM running 时，mux 等某个 VM 的 pending 中出现 `\n`，再一次取出一条完整逻辑行并加一个 `[VM n] ` 前缀；同一行被多次 backend write 分片时仍只加一次前缀。未结束片段留在该 VM 的 ring，不与另一 VM 的行拼接。
+`GuestOutputMux` 默认处于 `Interactive { foreground: None }`：无论当前有一台还是多台 running VM，客户机 TX 都只写入各自的 ring，不写宿主终端。Axvisor 的默认启动路径不自动附着客户机，也不进入 `BootMultiplex`。因此管理 shell 和宿主日志始终可见，而 Linux/ArceOS 等客户机的启动输出要到 `vm console <VM_ID>` 成功后才回放。
 
-`attach_default()` 会为默认前台设置 preemption：该 VM 下一次形成完整行时优先取得物理行。若另一个 owner 已在宿主上留下未结束物理行，切 owner 前先输出一个 `\n`，再打印新行及前缀。
+`BootMultiplex` 仍是仲裁器可显式选择的完整行输出模式，但不属于 Axvisor 默认启动流程。它只在调用方明确要求时同时观察多个 VM：只有一个 running VM 时，pending 字节立即输出且不加前缀；多个 VM running 时，mux 等某个 VM 的 pending 中出现 `\n`，再一次取出一条完整逻辑行并加一个 `[VM n] ` 前缀；同一行被多次 backend write 分片时仍只加一次前缀。未结束片段留在该 VM 的 ring，不与另一 VM 的行拼接。
 
 ### 6.2 `Interactive`
 
-`activate()` 或附着后的第一次普通输入会选择 foreground 并进入 Interactive。前台写先回放它在 ring 中的内容，再直接输出当前 bytes；后台 VM 只追加 ring，不写宿主。`Ctrl+X h`、前台 stop/delete/reconcile 会调用 `buffer_all()`，把 mode 设为 `Interactive { foreground: None }`，此后所有 guest 都只缓存。
+`activate()` 或附着后的第一次普通输入会选择 foreground 并进入 Interactive。前台写先回放它在 ring 中的内容，再直接输出当前 bytes；后台 VM 只追加 ring，不写宿主。`Ctrl+X h`、前台 stop/delete/reconcile 会调用 `buffer_all()`，把 mode 设为 `Interactive { foreground: None }`，此后所有 guest 都只缓存。对 Stopped VM 执行 `vm console` 使用非交互 replay：drain 指定 ring、补齐物理行，并保持 `foreground: None`，因此 shell 可继续执行下一条命令。
 
 每 VM ring 上限是 16 KiB。它在 backend 注册的任务上下文中一次预分配；vCPU 热路径满后只执行 pop/push，不扩容。继续追加会从头淘汰最旧字节并累计丢失数，因此保留最新日志并限制内存。下次形成可输出的 boot 行或切到该 VM 时，mux 先输出 `[Axvisor VM n console dropped N buffered bytes]` 摘要，再回放保留内容。`select_foreground()` 在同一个 `output_lock` 临界区内 drain ring 后接入直写；并发 writer 必须等回放完成，不能插到回放中间。ring 保存原始客户机字节，`[VM n]` 只在 BootMultiplex 输出完整行时临时生成，不会回流到客户机输入。
 
@@ -224,7 +230,7 @@ flowchart LR
 
 ## 7. 并发边界与当前限制
 
-控制台的并发正确性依赖几个显式约束：宿主输入单 reader、双锁固定顺序、vCPU0 独占设备 poll。下表逐条列出这些边界的当前保证与已知限制；SMP 唤醒限制是当前设计的已知约束而非实现缺陷，演进方向在本节末尾说明。
+控制台的并发正确性依赖几个显式约束：宿主输入单 reader、双锁固定顺序、vCPU0 独占设备 poll。下表逐条列出这些边界的当前保证与已知限制。
 
 | 边界 | 当前保证 | 限制 |
 | --- | --- | --- |
@@ -234,10 +240,25 @@ flowchart LR
 | VM notify | 入队后锁外 notify，不把 mux 锁带进 manager/scheduler | notify 失败只告警，字节等后续 poll |
 | 虚拟设备 poll | 只有 vCPU0 调用 `poll_vm_devices()`，它是串口 backend 的唯一 poll owner | secondary vCPU 不消费串口输入 |
 | 单 vCPU guest | `notify_vm()` 设置 Release 发布的 pending device-poll flag 并唤醒；vCPU0 用 Acquire/AcqRel 消费 | flag 只表达“需要 poll”，不计数；队列才保存字节 |
-| SMP guest | 当前沿用共享 wait queue 的 `notify_one()`，不发布 shared poll flag | 无法定向唤醒 vCPU0，可能只唤醒 secondary；空闲 SMP guest 的输入会延迟到 vCPU0 下次 VM-exit 或其他唤醒 |
+| SMP guest | 与单 vCPU guest 一样先发布 pending device-poll flag，再通过线程世代绑定的 capability 定向 kick vCPU0 | flag 只表达“需要 poll”，不计数；队列才保存字节 |
 | 输出并发 | `output_lock` 覆盖 format 与 ring replay；固定队列保持事务边界，只有 output worker 等待 UART | transport 满时丢弃当前完整事务；per-guest ring 淘汰最旧字节；两者均报告摘要且不阻塞 vCPU writer |
+| 网络输出 | 每端点独立 64 KiB 固定队列；有连接时 vCPU 只复制原始字节并通过 `IrqNotify` 唤醒对应网页输出任务 | 无连接时不保留历史也不获取网络队列锁；慢客户端只影响自身通道并最终触发该端点队列丢弃摘要 |
 
-SMP 限制不能通过让任意 vCPU poll 来规避，那会破坏设备 poll 的 single-owner 假设。正确演进方向是为 vCPU0 提供可定向的 wait/wake 路径，再为 SMP 发布 pending poll 请求。
+`browser-console` 在默认 VM 初始化后只获取一次运行时 VM 列表并按 VM ID 排序。网页通过 `/api/consoles` 获取这个启动快照，
+使用 `/ws/axvisor` 和 `/ws/vm-<真实 ID>` 路由，并直接显示客户机 TOML 的 `base.name`。
+零个客户机时只有管理窗格，一个、两个或三个客户机时分别生成两个、三个或四个窗格；
+运行中创建、删除 VM 不重建网络通道。超过三个启动客户机时，只为按 VM ID 排序后的前三个
+客户机创建网络通道，其余客户机仍正常启动并保留物理 UART 路径。
+这些 WebSocket 是无 TLS、无认证的原始控制台字节流，每端点同时只接受一个会话，只能用在受信任的管理网络。网络 shell 不给客户机提供 IP 栈；连接终止在 Axvisor 现有的 virtual-UART backend。
+
+启用 `browser-console` 后，Axvisor 会在配置的 HTTP 地址直接发布一个自适应页面。
+浏览器通过同源 WebSocket 取得 management/guest 独占会话、固定队列及溢出统计；
+该 feature 不隐式启用 `http-axum` VM 管理 API，也没有 raw TCP 控制台、per-lane dispatcher
+或 Tokio `mpsc` 中转。命令执行主机不参与运行时链路。页面的
+HTML、CSS 和 JavaScript 均编译进 Axvisor，不依赖 GitHub、CDN 或开发板根文件系统；
+不存在需要命令主机持续运行的网页代理路径。
+
+SMP 路径仍不能让任意 vCPU poll，那会破坏设备 poll 的 single-owner 假设。线程世代绑定的 vCPU0 kick capability 只解决定向 wait/wake；设备 poll 的所有权仍固定在 vCPU0。
 
 ## 8. 故障定位
 
@@ -248,8 +269,8 @@ SMP 限制不能通过让任意 vCPU poll 来规避，那会破坏设备 poll �
 | shell 和客户机都偶发丢字符 | `TaskConsoleInput` 是否被第二次取得；runtime RX error/overrun 统计是否增长 | 当前契约是 capability single-owner；RX IRQ 只采样并由 owner worker 发布 |
 | 输入空闲时 shell 占用 CPU | `wait_for_host_event()` 是否走 `wait_event()` / `wait_readable()` | shell 不应以 `yield_now()` 轮询 task-console |
 | 宿主日志插入正在编辑的命令 | 是否取得唯一日志订阅；记录是否经 `route_host_log()`；drop 摘要是否增长 | shell 模式必须清行、输出完整记录并重画；guest 前台模式必须缓存而非直写 |
-| `vm console` 报错 | VM ID 是否存在，状态是否严格为 `Running` | attach 不接受 Ready、Paused、Stopping 或 Stopped |
-| 客户机不立即收到输入 | 输入队列是否满及 overflow warning；`notify_vm` warning；guest 是否 SMP 且 vCPU0 空闲 | 4096 字节尾部丢弃并按 drain 周期报告一次；SMP notify 不能定向 vCPU0 |
+| `vm console` 报错 | VM ID 是否存在；Running VM 是否可附着；Stopped VM 是否仍有 console state | attach 不接受 Ready、Paused、Stopping；删除或从未建立 backend 的 VM 没有可回放 ring |
+| 客户机不立即收到输入 | 输入队列是否满及 overflow warning；`notify_vm` warning；vCPU0 是否持续产生可处理的 VM-exit | 4096 字节尾部丢弃并按 drain 周期报告一次；kick 会定向唤醒或退出 vCPU0 |
 | reset 后控制台永久无输入输出 | reset 前是否调用过 `mark_stopped()`；是否误以为 reset 会创建 backend | reset clone 同一 backend Arc，不会发布新 generation；已失效 generation 不会自动复活 |
 | replace/stop 后仍看到 late output | 应用路径是否真的调用 `mark_stopped()`/`remove()`；写入 backend generation 是否仍 current | 底层 stop/remove 不自动接入 mux；stale 写应在修改 output 前被拒绝 |
 | 多 VM 启动日志看似停住 | 对应 VM 是否只写了未结束片段 | BootMultiplex 在多 VM 时等完整 `\n` 行；切换 owner 才做物理补行 |
@@ -267,6 +288,9 @@ SMP 限制不能通过让任意 vCPU poll 来规避，那会破坏设备 poll �
 - BootMultiplex 多 VM 行前缀、默认附着和输入触发的抢占、命令 echo 后的前台结果；
 - 第一次前台输入进入 Interactive、切换时回放后台 ring、detach 后全部缓存；
 - foreground 或 background 未结束物理行在切换时正确补行。
+- VM 2 网络输入不改变物理 VM 1 foreground，并拒绝 stopped 或 stale backend；
+- 有连接的 VM 输出只进入对应网络通道，无连接时跳过网络输出路径；
+- 启动布局按 VM ID 排序、最多选择三个客户机并使用配置名称。
 
 `mux/output.rs` 另有 16 个内部测试，直接覆盖完整行选择、分片只加一次前缀、pending/total 容量上界、超大单次 write、16 KiB 淘汰与回放、Interactive 前台分片、reset/reconcile 后物理分隔符。`console_mux/transport.rs` 的 4 个测试验证 FIFO、队列满、超大事务和分块溢出时的整事务回滚。顶层 mux 测试还覆盖宿主完整日志隔离、guest 前台缓存与返回 shell 后回放；`axvm::runtime` 与 vCPU runtime 测试单 vCPU poll flag 和 SMP 不发布 shared flag 的差异。
 

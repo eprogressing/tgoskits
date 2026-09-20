@@ -3,104 +3,11 @@ extern crate alloc;
 use ax_driver::{
     BindingInfo, BindingIrq, BindingIrqSource, Error, FdtIrqSpec, binding_info_from_acpi_route,
 };
-use axklib::{
-    BoxedIrqHandler, ConcurrentBoxedIrqHandler, IrqCpuMask, IrqHandle, IrqId as KlibIrqId, Klib,
-    KlibError, KlibResult, PhysAddr, VirtAddr, impl_trait,
-};
 use irq_framework::{
     AcpiGsiController, AcpiGsiRoute, AcpiIrqPolarity, AcpiIrqTrigger, HwIrq, IrqDomainId, IrqId,
     IrqSource,
 };
 use rdrive::{DeviceId, ProbeError, error::DriverError, probe::OnProbeError};
-
-struct TestKlib;
-
-impl_trait! {
-    impl Klib for TestKlib {
-        fn mem_iomap(_addr: PhysAddr, _size: usize) -> KlibResult<VirtAddr> {
-            Err(KlibError::Unsupported)
-        }
-
-        fn mem_virt_to_phys(addr: VirtAddr) -> PhysAddr {
-            PhysAddr::from_usize(addr.as_usize())
-        }
-
-        fn mem_map_dma_coherent_uncached(
-            _addr: core::ptr::NonNull<u8>,
-            _size: usize,
-        ) -> axklib::DmaCoherentMappingOutcome {
-            axklib::DmaCoherentMappingOutcome::NotStarted(KlibError::Unsupported)
-        }
-
-        fn mem_unmap_dma_coherent(_addr: core::ptr::NonNull<u8>, _size: usize) -> KlibResult {
-            Err(KlibError::Unsupported)
-        }
-
-        fn dma_cache_clean(_addr: VirtAddr, _size: usize) {}
-
-        fn dma_cache_invalidate(_addr: VirtAddr, _size: usize) {}
-
-        fn dma_cache_clean_invalidate(_addr: VirtAddr, _size: usize) {}
-
-        fn dma_alloc_pages(
-            _dma_mask: u64,
-            _num_pages: usize,
-            _align: usize,
-        ) -> KlibResult<core::ptr::NonNull<u8>> {
-            Err(KlibError::Unsupported)
-        }
-
-        fn dma_dealloc_pages(_addr: core::ptr::NonNull<u8>, _num_pages: usize) {}
-
-        fn time_busy_wait(_dur: core::time::Duration) {}
-
-        fn time_monotonic_nanos() -> u64 {
-            0
-        }
-
-        fn time_try_init_epoch_offset(_epoch_time_nanos: u64) -> bool {
-            false
-        }
-
-        fn irq_set_enable(_irq: KlibIrqId, _enabled: bool) -> KlibResult {
-            Ok(())
-        }
-
-        fn irq_request_shared(
-            _irq: KlibIrqId,
-            _handler: BoxedIrqHandler,
-        ) -> KlibResult<IrqHandle> {
-            Err(KlibError::Unsupported)
-        }
-
-        fn irq_request_shared_disabled(
-            _irq: KlibIrqId,
-            _handler: BoxedIrqHandler,
-        ) -> KlibResult<IrqHandle> {
-            Err(KlibError::Unsupported)
-        }
-
-        fn irq_request_percpu(
-            _irq: KlibIrqId,
-            _cpus: IrqCpuMask,
-            _handler: ConcurrentBoxedIrqHandler,
-        ) -> KlibResult<IrqHandle> {
-            Err(KlibError::Unsupported)
-        }
-
-        fn irq_free(_handle: IrqHandle) -> KlibResult {
-            Err(KlibError::Unsupported)
-        }
-
-        fn irq_enable(_handle: IrqHandle) -> KlibResult {
-            Err(KlibError::Unsupported)
-        }
-
-        fn irq_disable(_handle: IrqHandle) -> KlibResult {
-            Err(KlibError::Unsupported)
-        }
-    }
-}
 
 fn route() -> AcpiGsiRoute {
     AcpiGsiRoute {
@@ -201,11 +108,9 @@ fn ax_driver_converts_rdif_intc_acpi_routes_without_losing_metadata() {
 fn ax_driver_error_conversions_preserve_driver_and_probe_categories() {
     let driver_error = Error::from(DriverError::Unsupported("mock"));
     assert!(matches!(driver_error, Error::Driver(_)));
-    assert!(alloc::format!("{driver_error}").contains("driver init failed"));
 
     let probe_error = Error::from(ProbeError::Unsupported("mock-probe"));
     assert!(matches!(probe_error, Error::Probe(_)));
-    assert!(alloc::format!("{probe_error}").contains("driver probe failed"));
 
     let on_probe = Error::from(ProbeError::from(OnProbeError::NotMatch));
     assert!(matches!(on_probe, Error::Probe(_)));

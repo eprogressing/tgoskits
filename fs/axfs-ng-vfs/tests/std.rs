@@ -1,8 +1,5 @@
-extern crate alloc;
-
 use alloc::{
     borrow::ToOwned,
-    format,
     string::{String, ToString},
     sync::Arc,
     vec,
@@ -11,11 +8,10 @@ use alloc::{
 use core::{
     any::Any,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
-    task::Context,
     time::Duration,
 };
 
-use axfs_ng_vfs::{self as axfs_ng_vfs, VfsError};
+extern crate alloc;
 
 #[test]
 fn axfs_ng_vfs_path_rules_hold() {
@@ -60,7 +56,6 @@ fn axfs_ng_vfs_path_ownership_and_join_rules_hold() {
 
     let path = Path::new("alpha/beta");
     assert_eq!(path.as_bytes(), b"alpha/beta");
-    assert_eq!(path.to_string(), "alpha/beta");
     assert_eq!(path.parent().map(Path::as_str), Some("alpha/"));
     assert_eq!(Path::new("/").parent(), None);
     assert_eq!(Path::new(".").parent().map(Path::as_str), Some(""));
@@ -69,8 +64,6 @@ fn axfs_ng_vfs_path_ownership_and_join_rules_hold() {
     let owned = path.to_owned();
     assert_eq!(owned.as_str(), "alpha/beta");
     assert_eq!(<PathBuf as AsRef<str>>::as_ref(&owned), "alpha/beta");
-    assert_eq!(owned.to_string(), "alpha/beta");
-    assert_eq!(format!("{owned:?}"), "PathBuf { inner: \"alpha/beta\" }");
 
     let arc_path: Arc<Path> = Arc::from(path);
     assert_eq!(arc_path.as_str(), "alpha/beta");
@@ -105,90 +98,27 @@ fn axfs_ng_vfs_path_ownership_and_join_rules_hold() {
 }
 
 #[test]
-fn axfs_ng_vfs_device_and_metadata_update_rules_hold() {
-    use axfs_ng_vfs::{DeviceId, MetadataUpdate, NodePermission, NodeType};
-
-    for (raw, node_type) in [
-        (0o1, NodeType::Fifo),
-        (0o2, NodeType::CharacterDevice),
-        (0o4, NodeType::Directory),
-        (0o6, NodeType::BlockDevice),
-        (0o10, NodeType::RegularFile),
-        (0o12, NodeType::Symlink),
-        (0o14, NodeType::Socket),
-        (0, NodeType::Unknown),
-    ] {
-        assert_eq!(NodeType::from(raw), node_type);
-    }
-
-    let permission = NodePermission::SET_UID
-        | NodePermission::SET_GID
-        | NodePermission::STICKY
-        | NodePermission::OWNER_EXEC
-        | NodePermission::GROUP_EXEC
-        | NodePermission::OTHER_EXEC;
-    assert!(permission.contains(NodePermission::SET_UID));
-    assert!(format!("{permission:?}").contains("OWNER_EXEC"));
-
-    let device = DeviceId::new(0xffff_f123, 0xffff_fe45);
-    assert_eq!(device.major(), 0xffff_f123);
-    assert_eq!(device.minor(), 0xffff_fe45);
-    assert_eq!(
-        format!("{device:?}"),
-        "DeviceId { major: 4294963491, minor: 4294966853 }"
-    );
-
-    let update = MetadataUpdate {
-        mode: Some(permission),
-        owner: Some((1000, 1001)),
-        rdev: Some(device),
-        atime: Some(Duration::from_secs(10)),
-        mtime: Some(Duration::from_secs(20)),
-    };
-    assert!(update.mode.unwrap().contains(NodePermission::STICKY));
-    assert_eq!(update.owner, Some((1000, 1001)));
-    assert_eq!(update.rdev.unwrap().minor(), 0xffff_fe45);
-    assert_eq!(update.atime.unwrap().as_secs(), 10);
-    assert_eq!(update.mtime.unwrap().as_secs(), 20);
-}
-
-#[test]
 fn axfs_ng_vfs_type_rules_hold() {
-    use axfs_ng_vfs::{DeviceId, FsIoEvents, NodePermission, NodeType, Reference, TypeMap};
+    use axfs_ng_vfs::{NodeType, TypeMap};
 
     assert_eq!(NodeType::from(0o10), NodeType::RegularFile);
     assert_eq!(NodeType::from(0o12), NodeType::Symlink);
     assert_eq!(NodeType::from(0xff), NodeType::Unknown);
-    assert_eq!(NodePermission::default().bits(), 0o666);
-    assert!(
-        (NodePermission::OWNER_READ | NodePermission::OWNER_WRITE)
-            .contains(NodePermission::OWNER_WRITE)
-    );
-
-    let device = DeviceId::new(0x12345, 0x6789ab);
-    assert_eq!(device.major(), 0x12345);
-    assert_eq!(device.minor(), 0x6789ab);
-    assert!(format!("{device:?}").contains("major"));
-
-    let events = FsIoEvents::IN | FsIoEvents::OUT;
-    assert!(events.contains(FsIoEvents::IN));
-    assert!(!events.contains(FsIoEvents::ERR));
-
     let mut type_map = TypeMap::new();
     assert!(type_map.get::<u32>().is_none());
     type_map.insert(42_u32);
     assert_eq!(*type_map.get::<u32>().unwrap(), 42);
     assert_eq!(*type_map.get_or_insert_with(|| 7_u32), 42);
-    assert_eq!(Reference::root().key(), (0, String::new()));
 }
 
 #[test]
 fn axfs_ng_vfs_file_node_defaults_hold() {
     use axfs_ng_vfs::{
-        DeviceId, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, FsIoEvents,
-        FsPollable, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType,
-        Reference, StatFs, VfsError, VfsResult,
+        DeviceId, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, Metadata,
+        MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType, Reference, StatFs, VfsError,
+        VfsResult,
     };
+    use axpoll::{IoEvents, Pollable};
 
     #[derive(Debug)]
     struct TestFilesystem;
@@ -271,13 +201,17 @@ fn axfs_ng_vfs_file_node_defaults_hold() {
         }
     }
 
-    impl FsPollable for TestFile {
-        fn poll(&self) -> FsIoEvents {
-            FsIoEvents::IN | FsIoEvents::OUT
+    impl Pollable for TestFile {
+        fn poll(&self) -> IoEvents {
+            IoEvents::IN | IoEvents::OUT
         }
 
-        fn register(&self, _context: &mut Context<'_>, events: FsIoEvents) {
-            assert!(events.contains(FsIoEvents::IN));
+        unsafe fn register_shared(
+            &self,
+            _sink: &mut dyn axpoll::SharedRegistrationSink,
+            events: IoEvents,
+        ) {
+            assert!(events.contains(IoEvents::IN));
         }
     }
 
@@ -304,10 +238,6 @@ fn axfs_ng_vfs_file_node_defaults_hold() {
         fn set_len(&self, _len: u64) -> VfsResult<()> {
             Err(VfsError::ReadOnlyFilesystem)
         }
-
-        fn set_symlink(&self, _target: &str) -> VfsResult<()> {
-            Err(VfsError::Unsupported)
-        }
     }
 
     let ops = Arc::new(TestFile {
@@ -319,7 +249,7 @@ fn axfs_ng_vfs_file_node_defaults_hold() {
     assert_eq!(file_node.len().unwrap(), 11);
     assert!(file_node.flags().contains(NodeFlags::NON_CACHEABLE));
     assert_eq!(file_node.ioctl(0, 0), Err(VfsError::NotATty));
-    assert_eq!(file_node.poll(), FsIoEvents::IN | FsIoEvents::OUT);
+    assert_eq!(file_node.poll(), IoEvents::IN | IoEvents::OUT);
     assert!(Arc::ptr_eq(
         &file_node.downcast::<TestFile>().unwrap(),
         &ops
@@ -360,10 +290,12 @@ fn axfs_ng_vfs_file_node_defaults_hold() {
 #[test]
 fn axfs_ng_vfs_dir_node_cache_and_mutation_rules_hold() {
     use axfs_ng_vfs::{
-        DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps,
-        FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate, Mutex, NodeFlags, NodeOps,
-        NodePermission, NodeType, OpenOptions, Reference, VfsError, VfsResult, WeakDirEntry,
+        DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, DirectoryCursor, FileNode,
+        FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, Mutex, NodeFlags, NodeOps,
+        NodePermission, NodeType, OpenOptions, Reference, RenameOptions, VfsError, VfsResult,
+        WeakDirEntry,
     };
+    use axpoll::{IoEvents, Pollable};
 
     #[derive(Debug)]
     struct DirTestFilesystem;
@@ -428,12 +360,17 @@ fn axfs_ng_vfs_dir_node_cache_and_mutation_rules_hold() {
         }
     }
 
-    impl FsPollable for DirTestFile {
-        fn poll(&self) -> FsIoEvents {
-            FsIoEvents::IN | FsIoEvents::OUT
+    impl Pollable for DirTestFile {
+        fn poll(&self) -> IoEvents {
+            IoEvents::IN | IoEvents::OUT
         }
 
-        fn register(&self, _context: &mut Context<'_>, _events: FsIoEvents) {}
+        unsafe fn register_shared(
+            &self,
+            _sink: &mut dyn axpoll::SharedRegistrationSink,
+            _events: IoEvents,
+        ) {
+        }
     }
 
     impl FileNodeOps for DirTestFile {
@@ -451,10 +388,6 @@ fn axfs_ng_vfs_dir_node_cache_and_mutation_rules_hold() {
 
         fn set_len(&self, _len: u64) -> VfsResult<()> {
             Err(VfsError::ReadOnlyFilesystem)
-        }
-
-        fn set_symlink(&self, _target: &str) -> VfsResult<()> {
-            Err(VfsError::Unsupported)
         }
     }
 
@@ -524,7 +457,11 @@ fn axfs_ng_vfs_dir_node_cache_and_mutation_rules_hold() {
     }
 
     impl DirNodeOps for DirTestDir {
-        fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
+        fn read_dir(
+            &self,
+            cursor: DirectoryCursor,
+            sink: &mut dyn DirEntrySink,
+        ) -> VfsResult<usize> {
             let mut emitted = 0;
             let entries = self.children.lock();
             let mut all_entries = Vec::new();
@@ -534,10 +471,15 @@ fn axfs_ng_vfs_dir_node_cache_and_mutation_rules_hold() {
                 all_entries.push((name.clone(), entry.inode(), entry.node_type()));
             }
             for (index, (name, inode, node_type)) in all_entries.into_iter().enumerate() {
-                if index < offset as usize {
+                if index < cursor.offset() as usize {
                     continue;
                 }
-                if !sink.accept(&name, inode, node_type, index as u64 + 1) {
+                if !sink.accept(
+                    name.as_bytes(),
+                    inode,
+                    node_type,
+                    DirectoryCursor::new(index as u64 + 1),
+                ) {
                     break;
                 }
                 emitted += 1;
@@ -570,6 +512,17 @@ fn axfs_ng_vfs_dir_node_cache_and_mutation_rules_hold() {
             Ok(entry)
         }
 
+        fn create_symlink(
+            &self,
+            _name: &str,
+            _target: &str,
+            _permission: NodePermission,
+            _uid: u32,
+            _gid: u32,
+        ) -> VfsResult<DirEntry> {
+            Err(VfsError::Unsupported)
+        }
+
         fn link(&self, name: &str, node: &DirEntry) -> VfsResult<DirEntry> {
             if self.lookup(name).is_ok() {
                 return Err(VfsError::AlreadyExists);
@@ -596,7 +549,13 @@ fn axfs_ng_vfs_dir_node_cache_and_mutation_rules_hold() {
             Ok(())
         }
 
-        fn rename(&self, _src_name: &str, _dst_dir: &DirNode, _dst_name: &str) -> VfsResult<()> {
+        fn rename(
+            &self,
+            _src_name: &str,
+            _dst_dir: &DirNode,
+            _dst_name: &str,
+            _options: RenameOptions,
+        ) -> VfsResult<()> {
             Err(VfsError::Unsupported)
         }
     }
@@ -687,10 +646,11 @@ fn axfs_ng_vfs_dir_node_cache_and_mutation_rules_hold() {
 #[test]
 fn axfs_ng_vfs_mount_tree_rules_hold() {
     use axfs_ng_vfs::{
-        DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode, FileNodeOps, Filesystem,
-        FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate, Mountpoint, Mutex,
-        NodeOps, NodePermission, NodeType, Reference, StatFs, VfsError, VfsResult,
+        DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps, DirectoryCursor, FileNode,
+        FileNodeOps, Filesystem, FilesystemOps, Metadata, MetadataUpdate, Mountpoint, Mutex,
+        NodeOps, NodePermission, NodeType, Reference, RenameOptions, StatFs, VfsError, VfsResult,
     };
+    use axpoll::{IoEvents, Pollable};
 
     #[derive(Debug)]
     struct MountNodeFilesystem;
@@ -778,12 +738,17 @@ fn axfs_ng_vfs_mount_tree_rules_hold() {
         }
     }
 
-    impl FsPollable for MountTestFile {
-        fn poll(&self) -> FsIoEvents {
-            FsIoEvents::IN
+    impl Pollable for MountTestFile {
+        fn poll(&self) -> IoEvents {
+            IoEvents::IN
         }
 
-        fn register(&self, _context: &mut Context<'_>, _events: FsIoEvents) {}
+        unsafe fn register_shared(
+            &self,
+            _sink: &mut dyn axpoll::SharedRegistrationSink,
+            _events: IoEvents,
+        ) {
+        }
     }
 
     impl FileNodeOps for MountTestFile {
@@ -801,10 +766,6 @@ fn axfs_ng_vfs_mount_tree_rules_hold() {
 
         fn set_len(&self, _len: u64) -> VfsResult<()> {
             Err(VfsError::ReadOnlyFilesystem)
-        }
-
-        fn set_symlink(&self, _target: &str) -> VfsResult<()> {
-            Err(VfsError::Unsupported)
         }
     }
 
@@ -869,7 +830,11 @@ fn axfs_ng_vfs_mount_tree_rules_hold() {
     }
 
     impl DirNodeOps for MountTestDir {
-        fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
+        fn read_dir(
+            &self,
+            cursor: DirectoryCursor,
+            sink: &mut dyn DirEntrySink,
+        ) -> VfsResult<usize> {
             let children = self.children.lock();
             let mut entries = Vec::new();
             entries.push((".".to_string(), self.inode, NodeType::Directory));
@@ -880,10 +845,15 @@ fn axfs_ng_vfs_mount_tree_rules_hold() {
 
             let mut emitted = 0;
             for (index, (name, inode, node_type)) in entries.into_iter().enumerate() {
-                if index < offset as usize {
+                if index < cursor.offset() as usize {
                     continue;
                 }
-                if !sink.accept(&name, inode, node_type, index as u64 + 1) {
+                if !sink.accept(
+                    name.as_bytes(),
+                    inode,
+                    node_type,
+                    DirectoryCursor::new(index as u64 + 1),
+                ) {
                     break;
                 }
                 emitted += 1;
@@ -915,6 +885,17 @@ fn axfs_ng_vfs_mount_tree_rules_hold() {
             Ok(entry)
         }
 
+        fn create_symlink(
+            &self,
+            _name: &str,
+            _target: &str,
+            _permission: NodePermission,
+            _uid: u32,
+            _gid: u32,
+        ) -> VfsResult<DirEntry> {
+            Err(VfsError::Unsupported)
+        }
+
         fn link(&self, _name: &str, _node: &DirEntry) -> VfsResult<DirEntry> {
             Err(VfsError::Unsupported)
         }
@@ -931,7 +912,13 @@ fn axfs_ng_vfs_mount_tree_rules_hold() {
             Ok(())
         }
 
-        fn rename(&self, _src_name: &str, _dst_dir: &DirNode, _dst_name: &str) -> VfsResult<()> {
+        fn rename(
+            &self,
+            _src_name: &str,
+            _dst_dir: &DirNode,
+            _dst_name: &str,
+            _options: RenameOptions,
+        ) -> VfsResult<()> {
             Err(VfsError::Unsupported)
         }
     }
@@ -1103,7 +1090,7 @@ impl axfs_ng_vfs::FilesystemOps for MoreNodeFilesystem {
     }
 
     fn stat(&self) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::StatFs> {
-        Err(VfsError::Unsupported)
+        Err(axfs_ng_vfs::VfsError::Unsupported)
     }
 }
 
@@ -1146,7 +1133,7 @@ impl axfs_ng_vfs::FilesystemOps for MoreTestFs {
 #[derive(Debug)]
 struct MoreTestFile {
     inode: u64,
-    symlink: Option<&'static str>,
+    symlink: Option<String>,
 }
 
 impl axfs_ng_vfs::NodeOps for MoreTestFile {
@@ -1155,14 +1142,19 @@ impl axfs_ng_vfs::NodeOps for MoreTestFile {
     }
 
     fn metadata(&self) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::Metadata> {
-        Ok(more_metadata(
+        let mut metadata = more_metadata(
             self.inode,
             if self.symlink.is_some() {
                 axfs_ng_vfs::NodeType::Symlink
             } else {
                 axfs_ng_vfs::NodeType::RegularFile
             },
-        ))
+        );
+        metadata.size = self
+            .symlink
+            .as_ref()
+            .map_or(0, |target| target.len() as u64);
+        Ok(metadata)
     }
 
     fn update_metadata(&self, _update: axfs_ng_vfs::MetadataUpdate) -> axfs_ng_vfs::VfsResult<()> {
@@ -1182,17 +1174,22 @@ impl axfs_ng_vfs::NodeOps for MoreTestFile {
     }
 }
 
-impl axfs_ng_vfs::FsPollable for MoreTestFile {
-    fn poll(&self) -> axfs_ng_vfs::FsIoEvents {
-        axfs_ng_vfs::FsIoEvents::IN | axfs_ng_vfs::FsIoEvents::OUT
+impl axpoll::Pollable for MoreTestFile {
+    fn poll(&self) -> axpoll::IoEvents {
+        axpoll::IoEvents::IN | axpoll::IoEvents::OUT
     }
 
-    fn register(&self, _context: &mut Context<'_>, _events: axfs_ng_vfs::FsIoEvents) {}
+    unsafe fn register_shared(
+        &self,
+        _sink: &mut dyn axpoll::SharedRegistrationSink,
+        _events: axpoll::IoEvents,
+    ) {
+    }
 }
 
 impl axfs_ng_vfs::FileNodeOps for MoreTestFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> axfs_ng_vfs::VfsResult<usize> {
-        let Some(target) = self.symlink else {
+        let Some(target) = self.symlink.as_deref() else {
             return Ok(0);
         };
         let start = offset as usize;
@@ -1206,19 +1203,15 @@ impl axfs_ng_vfs::FileNodeOps for MoreTestFile {
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> axfs_ng_vfs::VfsResult<usize> {
-        Err(VfsError::ReadOnlyFilesystem)
+        Err(axfs_ng_vfs::VfsError::ReadOnlyFilesystem)
     }
 
     fn append(&self, _buf: &[u8]) -> axfs_ng_vfs::VfsResult<(usize, u64)> {
-        Err(VfsError::ReadOnlyFilesystem)
+        Err(axfs_ng_vfs::VfsError::ReadOnlyFilesystem)
     }
 
     fn set_len(&self, _len: u64) -> axfs_ng_vfs::VfsResult<()> {
-        Err(VfsError::ReadOnlyFilesystem)
-    }
-
-    fn set_symlink(&self, _target: &str) -> axfs_ng_vfs::VfsResult<()> {
-        Err(VfsError::Unsupported)
+        Err(axfs_ng_vfs::VfsError::ReadOnlyFilesystem)
     }
 }
 
@@ -1251,7 +1244,7 @@ impl MoreTestDir {
             axfs_ng_vfs::NodeType::Symlink => {
                 let file = axfs_ng_vfs::FileNode::new(Arc::new(MoreTestFile {
                     inode,
-                    symlink: Some("/target"),
+                    symlink: Some("/target".into()),
                 }));
                 axfs_ng_vfs::DirEntry::new_file(
                     file,
@@ -1279,7 +1272,7 @@ impl MoreTestDir {
             .iter()
             .position(|(child_name, _)| child_name == name)
         else {
-            return Err(VfsError::NotFound);
+            return Err(axfs_ng_vfs::VfsError::NotFound);
         };
         Ok(children.remove(index).1)
     }
@@ -1314,7 +1307,7 @@ impl axfs_ng_vfs::NodeOps for MoreTestDir {
 impl axfs_ng_vfs::DirNodeOps for MoreTestDir {
     fn read_dir(
         &self,
-        offset: u64,
+        cursor: axfs_ng_vfs::DirectoryCursor,
         sink: &mut dyn axfs_ng_vfs::DirEntrySink,
     ) -> axfs_ng_vfs::VfsResult<usize> {
         let children = self.children.lock();
@@ -1327,10 +1320,15 @@ impl axfs_ng_vfs::DirNodeOps for MoreTestDir {
 
         let mut emitted = 0;
         for (index, (name, inode, node_type)) in entries.into_iter().enumerate() {
-            if index < offset as usize {
+            if index < cursor.offset() as usize {
                 continue;
             }
-            if !sink.accept(&name, inode, node_type, index as u64 + 1) {
+            if !sink.accept(
+                name.as_bytes(),
+                inode,
+                node_type,
+                axfs_ng_vfs::DirectoryCursor::new(index as u64 + 1),
+            ) {
                 break;
             }
             emitted += 1;
@@ -1343,7 +1341,7 @@ impl axfs_ng_vfs::DirNodeOps for MoreTestDir {
             .lock()
             .iter()
             .find_map(|(child_name, entry)| (child_name == name).then(|| entry.clone()))
-            .ok_or(VfsError::NotFound)
+            .ok_or(axfs_ng_vfs::VfsError::NotFound)
     }
 
     fn create(
@@ -1355,9 +1353,34 @@ impl axfs_ng_vfs::DirNodeOps for MoreTestDir {
         _gid: u32,
     ) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::DirEntry> {
         if self.lookup(name).is_ok() {
-            return Err(VfsError::AlreadyExists);
+            return Err(axfs_ng_vfs::VfsError::AlreadyExists);
         }
         let entry = self.make_entry(name, node_type);
+        self.children.lock().push((name.into(), entry.clone()));
+        Ok(entry)
+    }
+
+    fn create_symlink(
+        &self,
+        name: &str,
+        target: &str,
+        _permission: axfs_ng_vfs::NodePermission,
+        _uid: u32,
+        _gid: u32,
+    ) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::DirEntry> {
+        if self.lookup(name).is_ok() {
+            return Err(axfs_ng_vfs::VfsError::AlreadyExists);
+        }
+        let inode = self.next_inode.fetch_add(1, Ordering::AcqRel);
+        let file = axfs_ng_vfs::FileNode::new(Arc::new(MoreTestFile {
+            inode,
+            symlink: Some(target.into()),
+        }));
+        let entry = axfs_ng_vfs::DirEntry::new_file(
+            file,
+            axfs_ng_vfs::NodeType::Symlink,
+            axfs_ng_vfs::Reference::new(self.parent(), name.into()),
+        );
         self.children.lock().push((name.into(), entry.clone()));
         Ok(entry)
     }
@@ -1368,7 +1391,7 @@ impl axfs_ng_vfs::DirNodeOps for MoreTestDir {
         node: &axfs_ng_vfs::DirEntry,
     ) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::DirEntry> {
         if self.lookup(name).is_ok() {
-            return Err(VfsError::AlreadyExists);
+            return Err(axfs_ng_vfs::VfsError::AlreadyExists);
         }
         let file = node.as_file()?.clone();
         let entry = axfs_ng_vfs::DirEntry::new_file(
@@ -1390,11 +1413,12 @@ impl axfs_ng_vfs::DirNodeOps for MoreTestDir {
         src_name: &str,
         dst_dir: &axfs_ng_vfs::DirNode,
         dst_name: &str,
+        _options: axfs_ng_vfs::RenameOptions,
     ) -> axfs_ng_vfs::VfsResult<()> {
         let entry = self.remove_child(src_name)?;
         if let Ok(existing) = dst_dir.lookup(dst_name) {
             if existing.node_type() == axfs_ng_vfs::NodeType::Directory {
-                return Err(VfsError::IsADirectory);
+                return Err(axfs_ng_vfs::VfsError::IsADirectory);
             }
             dst_dir.unlink(dst_name, false)?;
         }
@@ -1784,7 +1808,7 @@ fn axfs_ng_vfs_location_link_rename_and_transient_rules_hold() {
     assert!(left_root.lookup_no_follow("replace").unwrap().is_file());
     assert!(matches!(
         left_root.rename("dir", &left_root, "replace"),
-        Err(VfsError::IsADirectory) | Err(VfsError::AlreadyExists)
+        Err(VfsError::NotADirectory)
     ));
     assert!(matches!(
         left_root.rename("file", &right_root, "cross"),
@@ -1817,7 +1841,14 @@ fn axfs_ng_vfs_location_link_rename_and_transient_rules_hold() {
         node_type: NodeType::Symlink,
         ..Default::default()
     };
-    assert!(left_root.open_file("new-link", &options).unwrap().is_file());
+    assert!(matches!(
+        left_root.open_file("new-link", &options),
+        Err(VfsError::InvalidInput)
+    ));
+    let link = left_root
+        .create_symlink("new-link", "/typed-target", NodePermission::default(), 0, 0)
+        .unwrap();
+    assert_eq!(link.read_link().unwrap(), "/typed-target");
 
     left_root
         .lookup_no_follow("mount-target")

@@ -65,25 +65,33 @@ AxVM 不把 `AxVM` 整体暴露给设备。设备在 bundle 中声明 grant；ru
 
 `RuntimeAccessPorts` 在 prepare 时装入 timer/wake/stop adapter。DMA 有意不成为可长期保存的 runtime port：`AxVM::try_write_device()` 等需要 guest memory 的入口以及 `poll_dma_devices()` 才创建 `VmGuestMemoryAccess`，调用返回后端口即失效。读访问不隐式注入 guest-memory port；写访问也只有同时具备临时 port 和匹配 grant 才能访问 guest memory。完整 grant API 和失败条件见[模拟设备框架第 6 章](./emulated-devices.md#6-访问上下文与运行时能力)。
 
+### 3.2 PCI routed endpoint 与生命周期屏障
+
+PCI host、resolved topology 和 endpoint bundle 共享同一个 `PciRootState`。endpoint 的 `PciRootBinding` lease 只在 endpoint object、validated contract、routed grant、`DmaGrant` 和 `IrqLine` 全部准备完成后发布；route 发布前，PCI BDF、BAR 和 capability metadata 对 guest 不可达。BAR/config callback 取得带 endpoint final `DeviceId` 的 `DeviceContext`，并在锁外使用 endpoint-owned `DmaGrant`，不会退回 root grant 或 `NoopDeviceContext`。
+
+每个 token 同时校验 `EndpointBindingGeneration`、`RoutedAdmissionEpoch` 和 admission-open 状态。普通 callback 的 IRQ 电平变化必须取得同一 binding generation 作用域的 `EndpointIrqTransitionPermit`；root registration、full reset 和 teardown 的 owner-side line cleanup 通过 lifecycle owner gate 串行执行。teardown 先撤回 route、关闭 admission、drain scoped leases/permits，再失效 binding generation，最后撤销物理 line。full reset 在向 guest 发布 status 0 前推进 `VirtioQueueGeneration`、等待所有 `ActivityPermit`，并重新应用 root 的最新 Command snapshot；任一阶段失败都保持 fail-closed，不能恢复 guest 或 IRQ admission。
+
+VirtIO PCI block 的 queue notify 只有在 `queue_enable && DRIVER_OK && BME && endpoint DmaGrant` 同时成立时才消费 guest descriptor。`ActivityPermit` 覆盖 backend、guest-memory、used/status 和 ISR/INTx publication/suppression 的完整 terminal path；reset 不持有 root、transport、router 或 ramdisk 锁等待 permit。BME 清除或 admission close 后新 operation 必须停止，已升级的旧 operation 依 captured snapshot 完成并在 permit drop 后才允许 reset 完成。
+
 每次 MMIO、PIO 或 SysReg 请求都构造成不可变的 `DeviceAccess`，其中包含总线、地址、宽度以及发起访问的 VM-local `DeviceVcpuId`。源 vCPU 必须由 exit handler 显式传入，不能从宿主 CPU 或当前执行上下文推断；它描述“谁发起了访问”，也不等同于设备随后选择的中断目标。runtime 按地址找到设备后，为这一次 `Device::read()` 或 `Device::write()` 创建 `DeviceContext`，回调返回后立即丢弃。
 
-### 3.2 typed services 的架构消费者
+### 3.3 typed services 的架构消费者
 
 `DeviceServices` 保存类型化的 VM-local capability。AxVM 在 prepare、exit 或 IRQ 路径中按 key 取出所需 service，无需用字符串或向下转换查找 `Device`。
 
 | 架构或子系统 | service / consumer | 用途 |
 | --- | --- | --- |
 | AArch64 | `Aarch64VgicRuntimeKey` | prepare 时给每个 vCPU attach vGIC 与 timer PPI；start/last-vCPU-exit 时 activate/deactivate assigned SPI 路径 |
-| RISC-V | `RiscvPlicRuntimeKey` | start/last-vCPU-exit 激活或停用物理 IRQ backing；MMIO 后及每次 guest run 前同步 vPLIC 的可投递状态到 `VSEIP` |
+| RISC-V | `RiscvPlicRuntimeKey` | start/last-vCPU-exit 激活或停用物理 IRQ backing；guest run 前同步 vPLIC 的可投递状态到 `VSEIP`，MMIO 访问后的同步由 vPLIC `Device` 自身完成 |
 | x86_64 | PIC、PIT、IOAPIC/interrupt-domain services | legacy PIC 查询、PIT 到期注入、IOAPIC 路由与 EOI 后重投递；设备图仍提供默认 `VirtualInterruptController` |
-| LoongArch64 | `PchPicOutputPortKey` | PCH-PIC MMIO 写和外部 IRQ 后排出 controller event，向架构中断输入发布结果 |
+| LoongArch64 | `PchPicOutputPortKey` | 外部 IRQ 路径操作 PCH-PIC 输入；PCH-PIC `Device` 通过构建时注入的 typed output sink 发布寄存器访问产生的 controller event |
 | IVC | `IvcApertureAllocatorKey`、`IvcNotifyEndpointKey` | runtime IVC API 分配 guest aperture、建立/撤销共享绑定并通知 subscriber；IVC service 不要求存在一个可直接访问的 `Device` |
 
 AArch64 的默认 controller 从 vGIC service 的 core 取得；其他三种架构从 sealed runtime 中按 controller ID 取得。Machine resources 单独保存这个 trait object，供通用 `pulse_interrupt()` 等 VM API 使用，而架构专属路径仍从 typed service 读取更丰富的能力。
 
 ### 3.3 poll 与 lifecycle
 
-vCPU0 是唯一的设备 poll owner，在主运行循环每轮调用 `poll_vm_devices()`：先轮询普通 pollables，再为 DMA-pollables 创建一次性的 `VmGuestMemoryAccess`。宿主控制台把输入入队后调用 `notify_vm()`，但其唤醒语义取决于 vCPU 数量。单 vCPU VM 走 `notify_device_poll()`，先设置可跨 WFI 保留的 pending poll request，再 `notify_one()`；vCPU0 下次进入循环时消费该 flag 并执行 poll。SMP VM 当前只对所有 vCPU 共享的 wait queue 调用 `notify_one()`，不发布 poll flag，也无法指定唤醒 vCPU0；如果被唤醒的是 secondary vCPU，空闲的 vCPU0 可能仍不运行，控制台输入会延迟到 vCPU0 因其他事件再次进入循环。无论哪条分支，控制台上下文都不直接调用 UART 或 vGIC。
+vCPU0 是唯一的设备 poll owner，在主运行循环每轮调用 `poll_vm_devices()`：先轮询普通 pollables，再为 DMA-pollables 创建一次性的 `VmGuestMemoryAccess`。宿主控制台把输入入队后调用 `notify_vm()`；runtime 先设置可跨 WFI 保留的 `device_poll_requested`，再通过线程世代绑定的 vCPU kick capability 定向唤醒 vCPU0。目标正在远端 CPU 的 guest mode 中时才发送 IPI，阻塞或尚未进入 guest 时只执行直接唤醒。因此单 vCPU 与 SMP VM 使用同一条 pending-before-kick 链路，secondary vCPU 不会误消费设备 poll 请求。控制台上下文仍不直接调用 UART 或 vGIC。
 
 lifecycle capability 的调用顺序由通用 runtime 固定：
 
@@ -135,12 +143,12 @@ x86 进入设备 runtime 的退出分为 scalar/string PIO、direct MMIO 和 MSR
 
 ### 4.3 RISC-V
 
-backend 直接报告的 `MmioRead/Write` 使用 strict handler；读写完成后同步 vPLIC `VSEIP`，miss 直接转成 `AxVmError`。同步通过 `set_vseip_level()` 同时更新 vCPU 的保存状态；vCPU 暂未 bound 时状态仍会保留，下一次载入前无需依赖当时的宿主执行上下文重新推断。
+backend 直接报告的 `MmioRead/Write` 使用通用 strict handler；handler 只调用 `DeviceRuntime::try_read/try_write`。vPLIC 的 `Device::read/write` 在成功访问后通过自身 runtime 发布 `VSEIP`，架构 exit 不识别设备类型，也不执行第二段具体设备后处理。同步通过 `set_vseip_level()` 同时更新 vCPU 的保存状态；vCPU 暂未 bound 时状态仍会保留，下一次载入前无需依赖当时的宿主执行上下文重新推断。
 
 对 `NestedPageFault`，AxVM 依次执行：
 
 1. 请 vCPU backend 解码这次 fault；若得到 MMIO 读写，调用 `try_handle_mmio_*()`；
-2. 命中设备时完成寄存器访问、同步 vPLIC `VSEIP` 并 `Continue`；
+2. 命中设备时由 dyn `Device::read/write` 完成寄存器访问及设备内部发布动作，然后 `Continue`；
 3. 未解码或设备 miss 时尝试 `handle_nested_page_fault()` 的 stage-2 路径；
 4. stage-2 仍未处理时记录地址和 access flags 的 warning，返回无 stop 原因的 `Complete`。
 
@@ -148,7 +156,7 @@ backend 直接报告的 `MmioRead/Write` 使用 strict handler；读写完成后
 
 ### 4.4 LoongArch64
 
-LoongArch64 的 direct MMIO 也使用 strict handler；MMIO 写成功后还会排出 PCH-PIC 事件。未命中即报错。
+LoongArch64 的 direct MMIO 也只使用通用 strict handler。PCH-PIC 构建结果包装了同一个 `Arc<dyn Device>` 接口，并在其成功读写后通过 typed output sink 排出 controller event；exit handler 不再调用 PCH-PIC 具体函数。未命中即报错。
 
 `NestedPageFault` 的顺序与 RISC-V 相同：先让 backend 解码并用 `try_handle_mmio_*()` 尝试设备，再尝试 stage-2，最后 warning + `Complete`。LoongArch 不在 miss 时伪造读值，也不把 direct MMIO 写静默丢弃。未知的其他 VM-exit 返回明确的 `Unsupported`。
 
@@ -269,7 +277,7 @@ guest EOI/DIR 使 vGIC 完成当前物理 activation。backend deactivate 在控
 | 显式 wired assert/deassert 的 sink 更新失败 | 返回 `IrqError`，aggregate 计数和 line 本地 asserted 状态回滚 | 调用方可重试 |
 | asserted `IrqLine` drop 时最后一次 sink deassert 失败 | 错误被忽略；source 移除已经提交，无法回滚或报告 | runtime 无法重试这次 drop 通知，sink 可能仍观察到旧电平 |
 | reset/suspend/resume 中 lifecycle 回调失败 | 立即停止后续回调并阻止 Machine 状态转换 | 不补偿已完成的前序回调；设备集合可能部分完成 |
-| 空闲 SMP guest 收到控制台输入 | `notify_vm()` 只 `notify_one()` 共享 wait queue，不设置 poll flag，可能唤醒 secondary vCPU | 不能保证 vCPU0 立即 poll；输入可能延迟到 vCPU0 的下一次退出或其他唤醒 |
+| 空闲 SMP guest 收到控制台输入 | `notify_vm()` 先发布 `device_poll_requested`，再定向 kick vCPU0 | vCPU0 被阻塞时直接唤醒；在远端 guest mode 时条件发送 IPI；secondary 不消费该请求 |
 | backend 不支持物理 backing | `Unsupported`，VM prepare/start 失败 | 不静默降级为近似语义 |
 | physical teardown 中 mask/deactivate/unbind 失败 | 保留可识别的 binding/claim；delivery state 按已完成阶段提交 | 允许重试；不会双重 deactivate 或提前归还 host ownership |
 

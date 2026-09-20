@@ -31,41 +31,19 @@ use ax_std as _;
 
 mod banner;
 mod config;
-#[cfg(any(
-    feature = "test-console-atomic-output",
-    feature = "test-console-interleave"
-))]
-mod console_regression;
 mod guest_console;
-#[cfg(feature = "http-axum")]
+#[cfg(any(feature = "browser-console", feature = "http-axum"))]
 mod http;
 mod manager;
+#[cfg(feature = "browser-console")]
+mod network_console;
+#[cfg(feature = "browser-console")]
+mod network_status;
+#[cfg(feature = "vcpu-perf-load")]
+mod perf_load;
 mod shell;
-mod virtio_blk;
-mod virtio_net;
-
-#[cfg(any(feature = "backtrace", feature = "test-panic-no-backtrace"))]
-fn init_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
-        // When the `backtrace` feature is NOT enabled, axbacktrace is compiled
-        // without `alloc` → Inner::Disabled → BT_ERROR requires_alloc.
-        // When the `backtrace` feature IS enabled, axbacktrace captures real
-        // frames (alloc=true, frames enumerated).
-        let backtrace = axbacktrace::Backtrace::capture().kind("panic");
-        let _ = ax_std::os::arceos::modules::ax_runtime::emergency_console::write_fmt(
-            format_args!("{info}\n{backtrace}\n"),
-        );
-    }));
-}
-
-#[cfg(feature = "test-console-atomic-output")]
-fn init_atomic_output_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
-        let _ = ax_std::os::arceos::modules::ax_runtime::emergency_console::write_fmt(
-            format_args!("{info}\n"),
-        );
-    }));
-}
+#[cfg(feature = "test-virq-delivery")]
+mod virq_regression;
 
 /// Axvisor kernel entry point.
 ///
@@ -75,25 +53,11 @@ fn init_atomic_output_panic_hook() {
 /// 2. Print the startup banner through its output worker.
 /// 3. Check and enable hardware virtualization on every CPU.
 /// 4. Build the default guest VMs.
-/// 5. Spawn the management plane first — the HTTP server so the API is live
-///    before any guest boots — then the VM lifecycle waiter and the shell.
+/// 5. Spawn the management plane first — the configured HTTP and network
+///    console services so they are live before any guest boots — then the VM
+///    lifecycle waiter and the physical-console shell.
 ///
-/// The vCPU tasks are pinned to the secondary CPUs via `phys_cpu_ids` in the
-/// VM configs, while the management console stays on the primary CPU.
 fn main() {
-    #[cfg(feature = "test-console-atomic-output")]
-    init_atomic_output_panic_hook();
-    #[cfg(any(feature = "backtrace", feature = "test-panic-no-backtrace"))]
-    init_panic_hook();
-
-    // Test-only panic paths — gated behind dedicated features so they never
-    // activate in normal builds.  These are consumed by test-suit cases that
-    // verify the backtrace markers (or their absence) via QEMU regex matching.
-    #[cfg(feature = "test-backtrace-panic")]
-    panic!("axvisor backtrace smoke test: deliberate panic to verify backtrace output");
-    #[cfg(feature = "test-panic-no-backtrace")]
-    panic!("axvisor no-backtrace smoke test: panic without backtrace");
-
     guest_console::configure_host_console()
         .unwrap_or_else(|error| panic!("failed to configure host console: {error:#}"));
 
@@ -104,32 +68,53 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed to initialize AxVM manager: {error:#}"));
 
     manager.init_default_vms();
+    #[cfg(feature = "vcpu-perf-load")]
+    let _performance_load = perf_load::start();
 
-    // The management HTTP server accepts connections in a loop and needs its
-    // own task so neither the shell nor the VMM blocks it. It is spawned first
-    // so the management API is ready as early as possible. `ax_std::thread::spawn`
-    // only enqueues the task — the main task keeps running until it yields or
-    // blocks — so the server's bind does not necessarily happen before
-    // `launch_default_vms` queues the vCPU tasks; the ordering is best-effort.
-    #[cfg(feature = "http-axum")]
+    // The browser-console registry snapshots the successfully initialized
+    // default VM set exactly once. Initialize it before HTTP so the browser's
+    // `/api/consoles` endpoint cannot observe a partially configured layout.
+    #[cfg(feature = "browser-console")]
+    network_console::start()
+        .unwrap_or_else(|error| panic!("failed to initialize browser consoles: {error:#}"));
+
+    // The optional HTTP server accepts connections in a loop and needs its
+    // own task so neither the shell nor the VMM blocks it. The console registry
+    // is already complete when this task is enqueued, but the server's bind
+    // still races guest task scheduling because spawning only enqueues work.
+    #[cfg(feature = "browser-console")]
     std::thread::Builder::new()
         .name("axvisor-http".into())
-        .spawn(http::serve)
-        .unwrap_or_else(|error| panic!("failed to start management HTTP server: {error}"));
+        .spawn(|| {
+            if let Err(error) = http::serve() {
+                let message = format!(
+                    "\r\nAxvisor web console unavailable:\r\n  bind = {}\r\n  error = {error:#}\r\n",
+                    http::bind_addr()
+                );
+                guest_console::submit_host_bytes(message.as_bytes());
+            }
+        })
+        .unwrap_or_else(|error| panic!("failed to start Axvisor HTTP server: {error}"));
 
-    #[cfg(feature = "test-console-atomic-output")]
-    console_regression::emit_atomic_output();
+    #[cfg(all(feature = "http-axum", not(feature = "browser-console")))]
+    std::thread::Builder::new()
+        .name("axvisor-http".into())
+        .spawn(|| {
+            http::serve().unwrap_or_else(|error| panic!("Axvisor HTTP server failed: {error:#}"));
+        })
+        .unwrap_or_else(|error| panic!("failed to start Axvisor HTTP server: {error}"));
 
-    #[cfg(feature = "test-console-interleave")]
-    console_regression::emit_interleave();
+    #[cfg(feature = "browser-console")]
+    network_status::start();
 
     // With `no-auto-start` the default VMs are only created (staying in
     // `Ready`) and the management plane boots them on demand, so nothing is
     // launched or waited on here.
     #[cfg(not(feature = "no-auto-start"))]
-    let started_vms = manager.launch_default_vms();
-    #[cfg(not(feature = "no-auto-start"))]
-    guest_console::attach_default(started_vms);
+    let _ = manager.launch_default_vms();
+
+    #[cfg(feature = "test-virq-delivery")]
+    virq_regression::start();
 
     #[cfg(not(feature = "no-auto-start"))]
     std::thread::Builder::new()
@@ -140,9 +125,6 @@ fn main() {
     #[cfg(not(feature = "no-auto-start"))]
     info!("[OK] Default guest initialized");
 
-    // The management console runs on the primary CPU (Core 0) while the vCPU
-    // tasks are pinned to Core 1 via `phys_cpu_ids`, so it stays responsive
-    // regardless of guest behavior.
     info!("shell task on CPU{}", axvm::host::cpu::current_id());
 
     shell::console_init();

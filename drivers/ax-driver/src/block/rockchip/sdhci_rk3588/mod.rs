@@ -23,23 +23,25 @@ use rdrive::{
     },
     register::{FdtInfo, ProbeFdt},
 };
-use sdhci_host::{HostClock, HostResetHook, HostTimer, Sdhci, rdif as sdhci_rdif};
+use sdhci_host::{HostClock, HostResetHook, Sdhci, rdif as sdhci_rdif};
 use sdmmc_protocol::{
     Error,
     error::{ErrorContext, Phase},
-    sdio::card::SdioSdmmc,
+    sdio::{SdMmcIrqHost, native::SdMmcCard},
 };
 
 use super::{
     card_init_preference, clock::enable_node_clocks, media_name, supports_block_card_protocol,
 };
-use crate::{block::ProbeFdtBlock, mmio::iomap};
+use crate::{block::ProbeFdtBlock, mmio::iomap, sdhci_runtime::install_host_timer};
 
 // RK3588 DWCMSHC follows Linux's normal SDHCI completion path: hard IRQ only
 // acknowledges and caches status; the bound hctx advances command/data state.
 const DWCMSHC_P_VENDOR_AREA1: usize = 0xe8;
 const DWCMSHC_AREA1_MASK: u16 = 0x0fff;
 const DWCMSHC_HOST_CTRL3: usize = 0x08;
+const DWCMSHC_HOST_CTRL3_CMD_CONFLICT: u32 = 1 << 0;
+const DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE: u32 = 1 << 4;
 const DWCMSHC_EMMC_CONTROL: usize = 0x2c;
 const DWCMSHC_CARD_IS_EMMC: u16 = 1 << 0;
 const DWCMSHC_EMMC_DLL_CTRL: usize = 0x800;
@@ -82,16 +84,6 @@ const PHY_SDCLKDL_DC_DEFAULT: u8 = 0x32;
 const PHY_SMPLDL_CNFG_BYPASS_EN: u8 = 1 << 1;
 const PHY_DLL_CTRL_ENABLE: u8 = 0x1;
 const PHY_DLL_CNFG2_JUMPSTEP: u8 = 0x0a;
-
-struct AxKlibHostTimer;
-
-static HOST_TIMER: AxKlibHostTimer = AxKlibHostTimer;
-
-impl HostTimer for AxKlibHostTimer {
-    fn now_ms(&self) -> u64 {
-        axklib::time::monotonic_nanos() / 1_000_000
-    }
-}
 
 struct RockchipSdhciClock {
     clock: ClockLine,
@@ -194,7 +186,7 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         warn!("rockchip-sdhci: no core clock found; using SDHCI internal clock divider");
     }
     host.set_reset_hook(RockchipSdhciResetHook { resets });
-    host.set_timer(&HOST_TIMER);
+    install_host_timer(&mut host);
     let dma = axklib::dma::device(dma_api::DmaDeviceInfo::new(
         dma_api::DmaDomainId::Direct,
         crate::binding_resolver::dma_coherency_from_fdt(info),
@@ -215,9 +207,10 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         media_name(preference),
         preference
     );
-    let mut card = SdioSdmmc::new(host);
+    let parts = host.into_parts();
+    let mut card = SdMmcCard::new(parts.bus);
     card.set_diagnostic_identity(identity);
-    let dev = sdhci_rdif::initializing_device(card, config, preference);
+    let dev = sdhci_rdif::BlockDevice::new_initializing(card, parts.irq, config, preference);
     let irq = probe.register_block(dev)?;
     info!("rockchip-sdhci block device registered irq={:?}", irq);
     Ok(())
@@ -255,7 +248,6 @@ fn init_rk3588_dwcmshc_after_reset(host: &mut Sdhci) -> Result<(), Error> {
         DWCMSHC_EMMC_MISC_CON,
         read_u32(base, DWCMSHC_EMMC_MISC_CON) | MISC_INTCLK_EN,
     );
-    write_u32(base, area1 + DWCMSHC_HOST_CTRL3, 0);
     write_u16(
         base,
         area1 + DWCMSHC_EMMC_CONTROL,
@@ -276,8 +268,15 @@ fn configure_rk3588_dwcmshc_clock(host: &mut Sdhci, target_hz: u32) -> Result<()
 
 fn configure_rk3588_dwcmshc_clock_regs(base: NonNull<u8>, area1: usize, target_hz: u32) {
     // Linux's rk35xx set_clock path disables command-conflict checks and
-    // programs the low-speed DLL bypass while SDHCI clock output is gated.
-    write_u32(base, area1 + DWCMSHC_HOST_CTRL3, 0);
+    // keeps the internal clock ungated while SDHCI clock output is gated.
+    // Preserve unrelated vendor bits because this register also carries
+    // controller-specific state outside the two Rockchip workarounds.
+    let host_ctrl3 = read_u32(base, area1 + DWCMSHC_HOST_CTRL3);
+    write_u32(
+        base,
+        area1 + DWCMSHC_HOST_CTRL3,
+        (host_ctrl3 & !DWCMSHC_HOST_CTRL3_CMD_CONFLICT) | DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE,
+    );
     if target_hz <= 52_000_000 {
         write_u32(base, DWCMSHC_EMMC_DLL_CTRL, 0);
         write_u32(
@@ -431,7 +430,18 @@ mod tests {
         let mut host = unsafe { Sdhci::new(base) };
         init_rk3588_dwcmshc_after_reset(&mut host).unwrap();
 
-        assert_eq!(read_u32(base, 0x0500 + DWCMSHC_HOST_CTRL3), 0);
+        let host_ctrl3 = read_u32(base, 0x0500 + DWCMSHC_HOST_CTRL3);
+        assert_eq!(host_ctrl3 & DWCMSHC_HOST_CTRL3_CMD_CONFLICT, 0);
+        assert_eq!(
+            host_ctrl3 & DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE,
+            DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE,
+            "RK3588 DWCMSHC must keep its internal clock ungated during identification"
+        );
+        assert_eq!(
+            host_ctrl3 & !(DWCMSHC_HOST_CTRL3_CMD_CONFLICT | DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE),
+            u32::MAX & !(DWCMSHC_HOST_CTRL3_CMD_CONFLICT | DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE),
+            "clock setup must preserve unrelated vendor bits"
+        );
         assert_eq!(
             read_u16(base, 0x0500 + DWCMSHC_EMMC_CONTROL) & DWCMSHC_CARD_IS_EMMC,
             DWCMSHC_CARD_IS_EMMC
@@ -495,7 +505,18 @@ mod tests {
         let mut host = unsafe { Sdhci::new(base) };
         configure_rk3588_dwcmshc_clock(&mut host, 400_000).unwrap();
 
-        assert_eq!(read_u32(base, 0x0500 + DWCMSHC_HOST_CTRL3), 0);
+        let host_ctrl3 = read_u32(base, 0x0500 + DWCMSHC_HOST_CTRL3);
+        assert_eq!(host_ctrl3 & DWCMSHC_HOST_CTRL3_CMD_CONFLICT, 0);
+        assert_eq!(
+            host_ctrl3 & DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE,
+            DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE,
+            "clock programming must disable the DWCMSHC internal clock gate"
+        );
+        assert_eq!(
+            host_ctrl3 & !(DWCMSHC_HOST_CTRL3_CMD_CONFLICT | DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE),
+            u32::MAX & !(DWCMSHC_HOST_CTRL3_CMD_CONFLICT | DWCMSHC_HOST_CTRL3_CLK_GATE_DISABLE),
+            "clock programming must preserve unrelated vendor bits"
+        );
         assert_eq!(
             read_u32(base, DWCMSHC_EMMC_DLL_CTRL),
             DWCMSHC_EMMC_DLL_BYPASS | DWCMSHC_EMMC_DLL_START

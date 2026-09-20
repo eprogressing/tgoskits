@@ -61,11 +61,13 @@ impl AxvmManager {
     }
 
     /// Create one VM from a TOML config string.
+    #[cfg(any(feature = "fs", feature = "http-axum"))]
     pub fn create_vm_from_toml(raw_cfg: &str) -> Result<VMId> {
         crate::config::init_guest_vm(raw_cfg).context("create VM from TOML configuration")
     }
 
     /// Start a VM by ID.
+    #[cfg(any(feature = "fs", feature = "http-axum"))]
     pub fn start_vm(vm_id: VMId) -> Result<()> {
         AxvmRuntime::start_vm(vm_id).with_context(|| format!("start VM[{vm_id}]"))
     }
@@ -73,6 +75,12 @@ impl AxvmManager {
     /// Stop a VM by ID.
     pub fn stop_vm(vm_id: VMId) -> Result<()> {
         AxvmRuntime::stop_vm(vm_id).with_context(|| format!("stop VM[{vm_id}]"))
+    }
+
+    /// Pause a VM by ID.
+    #[cfg(feature = "http-axum")]
+    pub fn pause_vm(vm_id: VMId) -> Result<()> {
+        AxvmRuntime::pause_vm(vm_id).with_context(|| format!("pause VM[{vm_id}]"))
     }
 
     /// Resume a VM by ID.

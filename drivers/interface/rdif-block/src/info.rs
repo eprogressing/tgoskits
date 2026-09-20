@@ -2,10 +2,13 @@ use dma_api::{DmaConstraints, DmaDeviceInfo};
 
 use crate::request::RequestFlags;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub num_blocks: u64,
+    /// Addressing unit used by every request LBA and block count.
     pub logical_block_size: usize,
+    /// Smallest device block that may require read-modify-write internally.
+    pub physical_block_size: usize,
     pub read_only: bool,
     pub name: Option<&'static str>,
     pub vendor: Option<&'static str>,
@@ -17,15 +20,22 @@ impl DeviceInfo {
         Self {
             num_blocks,
             logical_block_size,
+            physical_block_size: logical_block_size,
             read_only: false,
             name: None,
             vendor: None,
             model: None,
         }
     }
+
+    /// Overrides the physical block size reported by the device.
+    pub const fn with_physical_block_size(mut self, physical_block_size: usize) -> Self {
+        self.physical_block_size = physical_block_size;
+        self
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueLimits {
     /// Complete DMA identity and constraints of the physical device served by this queue.
     pub dma: DmaDeviceInfo,
@@ -103,7 +113,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueInfo {
     pub id: usize,
     pub device: DeviceInfo,

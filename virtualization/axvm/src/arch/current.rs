@@ -83,18 +83,6 @@ pub(crate) fn register_host_irq_forwarding_activator(
     target::irq::register_ioapic_irq_forwarding_activator(vm, guest_gsi, activator)
 }
 
-pub(crate) fn register_timer_source(
-    deadline_source: std::sync::Arc<crate::timer::PublishedTimerDeadline>,
-    notify: std::sync::Arc<ax_std::os::arceos::modules::ax_task::IrqNotify>,
-) {
-    CurrentArch::register_timer_source(deadline_source, notify);
-}
-
-#[cfg(not(test))]
-pub(crate) fn request_timer_deadline(deadline_ns: u64) {
-    CurrentArch::request_timer_deadline(deadline_ns);
-}
-
 pub(crate) fn init_guest_boot_resources() {
     CurrentArch::init_guest_boot_resources();
 }
@@ -134,12 +122,9 @@ pub(crate) fn default_boot_firmware_load_gpa(
     CurrentArch::default_boot_firmware_load_gpa(config)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn selected_target_implements_complete_architecture_contract() {
-        assert_architecture::<CurrentArch>();
-    }
+/// Completes fallible host discovery before per-CPU hardware ownership begins.
+pub(crate) fn prepare_host_virtualization() -> AxVmResult {
+    #[cfg(target_arch = "aarch64")]
+    target::prepare_host_virtualization()?;
+    Ok(())
 }

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2](https://github.com/rcore-os/tgoskits/compare/nvme-driver-v0.8.1...nvme-driver-v0.8.2) - 2026-09-09
+
+### Other
+
+- *(ax-task)* rebuild scheduler and runtime ownership ([#1775](https://github.com/rcore-os/tgoskits/pull/1775))
+
+## [0.8.1](https://github.com/rcore-os/tgoskits/compare/nvme-driver-v0.8.0...nvme-driver-v0.8.1) - 2026-08-25
+
+### Fixed
+
+- *(ax-fs-ng)* stabilize block runtime lifecycle publication ([#2135](https://github.com/rcore-os/tgoskits/pull/2135))
+
 ## [0.8.0](https://github.com/rcore-os/tgoskits/compare/nvme-driver-v0.7.5...nvme-driver-v0.8.0) - 2026-08-20
 
 ### Added

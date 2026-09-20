@@ -7,8 +7,6 @@ use ax_memory_addr::VirtAddr;
 use super::Aarch64Arch;
 use crate::{architecture::*, *};
 
-impl HostTimePlatform for Aarch64Arch {}
-
 impl Architecture for Aarch64Arch {}
 
 impl MachinePlatform for Aarch64Arch {
@@ -18,8 +16,12 @@ impl MachinePlatform for Aarch64Arch {
 
 impl BootImagePlatform for Aarch64Arch {
     fn make_guest_memory_visible(addr: VirtAddr, size: usize) {
+        // The loader wrote through a cacheable host alias. A guest may update
+        // relocation data with its caches disabled before enabling them. Do
+        // not retain clean host lines that could resurrect the older contents.
+        // Image loading owns this range before the guest starts executing.
         aarch64_cpu_ext::cache::dcache_range(
-            aarch64_cpu_ext::cache::CacheOp::Clean,
+            aarch64_cpu_ext::cache::CacheOp::CleanAndInvalidate,
             addr.as_usize(),
             size,
         );
@@ -91,32 +93,26 @@ pub(super) fn patch_runtime_fdt(
     let initrd = vm.with_config(|config| {
         super::fdt::initrd_start_size_from_image_config(config.image_config.ramdisk.as_ref())
     });
-    let (
-        serial_profile,
-        serial_identity,
-        additional_serials,
-        ivc_channels,
-        gic_profile,
-        timer_profile,
-    ) = vm.with_architecture_plan(|plan| {
-        Ok((
-            plan.serial_profile(),
-            plan.serial_fdt_identity().cloned(),
-            plan.serial_devices()
-                .iter()
-                .filter(|serial| serial.id() != "console0")
-                .map(crate::machine::ResolvedSerialDevice::profile)
-                .collect::<std::vec::Vec<_>>(),
-            plan.ivc_channels().to_vec(),
-            plan.gic_profile().clone(),
-            plan.timer_profile().clone(),
-        ))
-    })?;
+    let (serial_profile, serial_identity, additional_serials, devices, gic_profile, timer_profile) =
+        vm.with_architecture_plan(|plan| {
+            Ok((
+                plan.serial_profile(),
+                plan.serial_fdt_identity().cloned(),
+                plan.serial_devices()
+                    .iter()
+                    .filter(|serial| serial.id() != "console0")
+                    .map(crate::machine::ResolvedSerialDevice::profile)
+                    .collect::<std::vec::Vec<_>>(),
+                plan.firmware_devices().to_vec(),
+                plan.gic_profile().clone(),
+                plan.timer_profile().clone(),
+            ))
+        })?;
     crate::boot::fdt::core::create::patch_guest_fdt_for_runtime(
         crate::boot::fdt::core::create::GuestFdtRuntimePatch {
             fdt_bytes,
             memory_regions: &vm.memory_regions(),
-            ivc_channels: &ivc_channels,
+            devices: &devices,
             crate_config,
             serial_profile,
             serial_identity: serial_identity.as_ref(),

@@ -43,6 +43,7 @@ impl PosixError {
     pub const EOPNOTSUPP: Self = Self::Errno(Errno::EOPNOTSUPP);
     pub const EPERM: Self = Self::Errno(Errno::EPERM);
     pub const ERANGE: Self = Self::Errno(Errno::ERANGE);
+    pub const ESRCH: Self = Self::Errno(Errno::ESRCH);
 
     /// Returns the Linux errno exposed at the C ABI boundary.
     pub fn errno(self) -> Errno {
@@ -123,7 +124,9 @@ fn vfs_error_to_errno(error: VfsError) -> Errno {
         VfsError::BadAddress | VfsError::BadState => Errno::EFAULT,
         VfsError::BadFileDescriptor => Errno::EBADF,
         VfsError::CrossesDevices => Errno::EXDEV,
+        VfsError::DataMissing => Errno::ENODATA,
         VfsError::DirectoryNotEmpty => Errno::ENOTEMPTY,
+        VfsError::FilesystemCorrupted => Errno::EUCLEAN,
         VfsError::FilesystemLoop => Errno::ELOOP,
         VfsError::FileTooLarge => Errno::EFBIG,
         VfsError::InvalidData | VfsError::InvalidInput => Errno::EINVAL,
@@ -140,11 +143,15 @@ fn vfs_error_to_errno(error: VfsError) -> Errno {
         VfsError::OperationNotPermitted => Errno::EPERM,
         VfsError::OperationNotSupported => Errno::EOPNOTSUPP,
         VfsError::PermissionDenied => Errno::EACCES,
+        VfsError::QuotaExceeded => Errno::EDQUOT,
         VfsError::ReadOnlyFilesystem => Errno::EROFS,
         VfsError::ResourceBusy => Errno::EBUSY,
         VfsError::StorageFull => Errno::ENOSPC,
+        VfsError::TextFileBusy => Errno::ETXTBSY,
         VfsError::TimedOut => Errno::ETIMEDOUT,
+        VfsError::TooManyLinks => Errno::EMLINK,
         VfsError::Unsupported => Errno::ENOSYS,
+        VfsError::ValueOverflow => Errno::EOVERFLOW,
         VfsError::WouldBlock => Errno::EAGAIN,
     }
 }

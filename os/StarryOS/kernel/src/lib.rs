@@ -1,65 +1,25 @@
 //! The core functionality of a monolithic kernel, including loading user
 //! programs and managing processes.
+//!
+//! Published page tables have no external mutable escape hatch. Callers must
+//! use the address-space mutation APIs, which own TLB invalidation and deferred
+//! reclaim:
+//!
+//! ```compile_fail
+//! fn bypass_mm_owner(aspace: &mut starry_kernel::mm::AddrSpace) {
+//!     let _page_table = aspace.page_table_mut();
+//! }
+//! ```
 
 #![no_std]
-#![feature(likely_unlikely)]
-#![feature(c_variadic)]
+#![cfg_attr(not(axtest), feature(likely_unlikely))]
+#![cfg_attr(not(axtest), feature(allocator_api))]
 #![allow(missing_docs)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-extern crate alloc;
-extern crate ax_runtime;
-
-#[macro_use]
-extern crate ax_log;
-
-#[macro_use]
-pub mod dyn_debug; // Re-export debug macros for use in other modules. It will override the `debug` macro from `log` crate when `dynamic_debug` feature is enabled.
-
-pub mod entry;
-
-#[cfg(axtest)]
-#[doc(hidden)]
-pub mod axtest_exports;
-#[cfg(all(test, not(axtest)))]
-mod axtest_exports;
-
-#[cfg(test)]
-mod host_link_symbols {
-    // Host unit tests do not execute the bare-metal boot path, but someboot's
-    // linked API refers to linker-script symbols even when those functions are
-    // dead code. Provide inert symbols so the standard test harness can link;
-    // runtime semantics remain covered only by the target axtest binary.
-    #[unsafe(no_mangle)]
-    static STACK_SIZE: usize = 0;
-    #[unsafe(no_mangle)]
-    static PAGE_SIZE: usize = 0;
-    #[unsafe(no_mangle)]
-    static __PERCPU_TEMPLATE_ALIGN_START: usize = 0;
-    #[unsafe(no_mangle)]
-    static __PERCPU_TEMPLATE_ALIGN_END: usize = 0;
-}
-
-mod cgroup;
-mod config;
-mod ebpf;
-mod error;
-mod file;
-mod ipc;
-mod kmod;
-pub mod kprobe;
-mod mm;
-mod namespace;
-mod perf;
-mod pseudofs;
-mod stop_machine;
-mod sync;
-mod syscall;
-mod task;
-mod time;
-mod tracepoint;
-mod trap;
-mod uprobe;
-
-pub use error::{DmaOperation, StarryError, StarryResult};
-pub use syscalls::Errno;
+// The freestanding axtest target includes `root.rs` directly so that module-local
+// tests and kernel entry symbols are emitted exactly once. Keep Cargo's implicit
+// library dependency empty for that target; linking a second kernel instance
+// would duplicate trap handlers, allocators, and runtime state.
+#[cfg(not(axtest))]
+include!("root.rs");

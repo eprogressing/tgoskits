@@ -13,6 +13,8 @@
 
 use alloc::{boxed::Box, sync::Arc};
 
+use ax_lazyinit::OnceLock;
+
 use super::BindSlot;
 use crate::{NetError, NetResult};
 
@@ -20,6 +22,8 @@ use crate::{NetError, NetResult};
 ///
 /// Provides filesystem backing for Unix domain socket path bindings.
 /// Abstract namespace sockets are handled separately within ax-net.
+/// Callbacks run in sleepable task context: path lookup, creation, and removal
+/// can perform filesystem I/O and wait for filesystem locks.
 pub trait UnixNamespace: Send + Sync {
     /// Resolve an existing socket path binding.
     fn resolve(&self, path: &str) -> NetResult<Arc<BindSlot>>;
@@ -31,7 +35,7 @@ pub trait UnixNamespace: Send + Sync {
     fn unbind(&self, path: &str) -> NetResult<()>;
 }
 
-static UNIX_NS: ax_lazyinit::OnceLock<Box<dyn UnixNamespace>> = ax_lazyinit::OnceLock::new();
+static UNIX_NS: OnceLock<Box<dyn UnixNamespace>> = OnceLock::new();
 
 /// Register Unix namespace provider.
 ///

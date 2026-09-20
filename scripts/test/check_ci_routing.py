@@ -7,6 +7,10 @@ from pathlib import Path
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 WORKSPACE_MANIFEST = WORKSPACE_ROOT / "Cargo.toml"
 CI_WORKFLOW = WORKSPACE_ROOT / ".github/workflows/ci.yml"
+REUSABLE_CHECK_MATRIX = (
+    WORKSPACE_ROOT / ".github/workflows/reusable-check-matrix.yml"
+)
+PR_CLEANUP_WORKFLOW = WORKSPACE_ROOT / ".github/workflows/ci-pr-cleanup.yml"
 LEGACY_BRANCH_WORKFLOW = WORKSPACE_ROOT / ".github/workflows/ci-branch-push.yml"
 
 
@@ -14,12 +18,19 @@ def main() -> int:
     errors: list[str] = []
     if not CI_WORKFLOW.is_file():
         errors.append("missing workflow: .github/workflows/ci.yml")
+    if not REUSABLE_CHECK_MATRIX.is_file():
+        errors.append(
+            "missing workflow: .github/workflows/reusable-check-matrix.yml"
+        )
+    if PR_CLEANUP_WORKFLOW.exists():
+        errors.append("stale-run cleanup must reuse the Plan CI runner")
     if LEGACY_BRANCH_WORKFLOW.exists():
         errors.append("branch push routing must be part of ci.yml")
     if errors:
         return report(errors)
 
     ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    reusable_check_matrix = REUSABLE_CHECK_MATRIX.read_text(encoding="utf-8")
     ci_triggers = mapping_block(ci_workflow, "on", 0)
     ci_push = mapping_block(ci_triggers, "push", 2)
     pull_request = mapping_block(ci_triggers, "pull_request", 2)
@@ -27,6 +38,31 @@ def main() -> int:
     plan_ci = mapping_block(jobs, "plan_ci", 2)
     if mapping_block(ci_push, "branches", 4):
         errors.append("main CI push trigger must accept every branch")
+
+    concurrency = mapping_block(ci_workflow, "concurrency", 0)
+    for protected_ref in ("main", "dev"):
+        require_contains(
+            errors,
+            concurrency,
+            f"github.ref == 'refs/heads/{protected_ref}'",
+            f"{protected_ref} CI runs must use a stable per-ref concurrency group",
+        )
+    for fragment, message in (
+        (
+            "github.event_name != 'pull_request'",
+            "pull request runs must not enter main or dev concurrency queues",
+        ),
+        (
+            "format('ci-{0}-{1}', github.workflow, github.ref)",
+            "main and dev CI queues must be isolated by ref",
+        ),
+        (
+            "format('ci-{0}-{1}', github.workflow, github.run_id)",
+            "non-protected runs must use unique concurrency groups",
+        ),
+        ("queue: max", "main and dev CI queues must preserve every commit"),
+    ):
+        require_contains(errors, concurrency, fragment, message)
 
     pull_request_paths = list_items_in_order(pull_request, "paths", 4)
     if not pull_request_paths or pull_request_paths[-1] != "!**/*.md":
@@ -203,6 +239,18 @@ def main() -> int:
         errors.append(
             "stale-run cleanup must force-cancel runs that ignore normal cancellation"
         )
+    require_contains(
+        errors,
+        cancel_step,
+        "github.event.pull_request.head.repo.full_name == github.repository",
+        "stale-run cleanup must only execute for same-repository pull requests",
+    )
+    require_contains(
+        errors,
+        cancel_step,
+        "github.event_name != 'pull_request'",
+        "the non-protected ref branch must not re-enable fork PR cleanup",
+    )
 
     pull_request_selector, push_selector = shell_if_else_branches(
         ci_workflow,
@@ -213,12 +261,43 @@ def main() -> int:
     else:
         for fragment, message in (
             (
+                "PR_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}",
+                "PR cleanup must receive the pull request head branch",
+            ),
+            (
+                "PR_HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id || '' }}",
+                "PR cleanup must receive the pull request head repository ID",
+            ),
+        ):
+            require_contains(errors, cancel_step, fragment, message)
+        for fragment, message in (
+            (
                 '.event == "pull_request"',
                 "PR cleanup must only select pull request runs",
             ),
             (
                 ".pull_requests[]?",
                 "PR cleanup must select runs for the same pull request",
+            ),
+            (
+                "(.pull_requests | length) == 0",
+                "PR cleanup must detect runs without pull request links",
+            ),
+            (
+                'env.PR_HEAD_REF != ""',
+                "PR cleanup must reject an empty head branch",
+            ),
+            (
+                'env.PR_HEAD_REPOSITORY_ID != ""',
+                "PR cleanup must reject an empty head repository ID",
+            ),
+            (
+                ".head_branch == env.PR_HEAD_REF",
+                "PR cleanup must match the head branch",
+            ),
+            (
+                ".head_repository.id == (env.PR_HEAD_REPOSITORY_ID | tonumber)",
+                "PR cleanup must match the stable head repository ID",
             ),
         ):
             require_contains(errors, pull_request_selector, fragment, message)
@@ -250,6 +329,9 @@ def main() -> int:
         if not job:
             errors.append(f"missing grouped CI job: {job_id}")
             continue
+        # Starry and AxVisor combine independent QEMU and board targets. A failed board
+        # must not cancel the other targets and discard their test evidence.
+        fail_fast = "false" if output_prefix in ("starry", "axvisor") else "true"
         for fragment, message in (
             (f"name: {display_name}", "must expose the expected group name"),
             ("- plan_ci", "must depend on Plan CI"),
@@ -283,7 +365,7 @@ def main() -> int:
                 f"needs.plan_ci.outputs.{output_prefix}_matrix",
                 "must consume its planner matrix",
             ),
-            ("fail_fast: true", "must keep fail-fast within the group"),
+            (f"fail_fast: {fail_fast}", "must preserve its failure collection policy"),
             ("save_cache: >-", "must preserve cache-save routing"),
             (
                 "since_ref: ${{ needs.plan_ci.outputs.since_ref }}",
@@ -307,6 +389,24 @@ def main() -> int:
                 f"steps.matrix.outputs.{output_prefix}_{output_name}",
                 f"Plan CI must publish {output_prefix}_{output_name}",
             )
+
+    max_parallel_input = mapping_block(
+        reusable_check_matrix,
+        "max_parallel",
+        6,
+    )
+    for fragment, message in (
+        ("type: number", "matrix parallelism must use a numeric limit"),
+        ("default: 256", "matrix entries must not be serialized by default"),
+    ):
+        require_contains(errors, max_parallel_input, fragment, message)
+    strategy = mapping_block(reusable_check_matrix, "strategy", 4)
+    require_contains(
+        errors,
+        strategy,
+        "max-parallel: ${{ inputs.max_parallel }}",
+        "the reusable matrix must honor its parallelism limit",
+    )
 
     return report(errors)
 

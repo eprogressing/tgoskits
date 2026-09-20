@@ -18,7 +18,7 @@ endpoint，hard IRQ 工作有固定上限，runtime 接管失败进入确定的�
 稳定 errno，并由确定性测试覆盖关键并发窗口。
 
 本次明确不引入公共 channel、全局 lock-free MPSC、自适应高低水位、串口专用调度类或
-RT priority。RX SPSC、TTY 有界 `SpinLock` 队列、控制队列和 `IrqNotify` 继续承担原有
+RT priority。RX SPSC、TTY 有界 `SpinLock` 队列、控制队列和 `FixedIrqWorkerSignal` 继续承担原有
 职责；普通内核日志改用 runtime 私有的每 CPU 有界 record ring，避免日志生产者争用同一
 TX ingress，并使日志背压不再占用 TTY 容量。扩大调度器或通用通信抽象不能直接修复
 寄存器所有权问题。
@@ -101,7 +101,7 @@ runtime 自身的终态：即使它仍出现在已发现设备表中，per-port 
 register gate 转为 terminal ownership、mask device-local source；fail-close 返回后 normal
 worker 和 IRQ endpoint 都无法重新取得寄存器，不依赖 watchdog 或延时清理任务。
 
-当 runtime 同时具备 `irq + multitask` 时，公共层自动在 scheduler、IRQ、设备探测和 serial
+IRQ 与多任务是 runtime 基础能力。公共层在 scheduler、IRQ、设备探测和 serial
 worker 就绪后、但在第一个 AP 启动前尝试接管，不再要求 OS 配置 `serial` 或
 `runtime-console` feature。firmware 给出硬件 `DeviceId` 时只接受精确匹配；只有
 `NotSpecified` 才按统一 `ttyS` 编号回退到 `ttyS0`。若没有探测到匹配的 runtime UART，
@@ -128,7 +128,7 @@ hard IRQ 只允许：
 1. 读取和确认该 UART 的 source/status；
 2. 向固定 64 项 `SerialIrqReport` 放入 RX sample；
 3. mask 需要 deferred service 的 UART source；
-4. 发布 report 并用 `IrqNotify` 唤醒 worker。
+4. 发布 report 并用 `FixedIrqWorkerSignal` 唤醒固定的 owner worker。
 
 IRQ 中禁止分配、阻塞、调用 runtime/platform callback、操作 TTY 或关闭 interrupt
 controller line。共享 IRQ 返回 `None` 表示本 UART 未产生事件。
@@ -156,9 +156,10 @@ consumer 释放空间后沿现有 notify 路径唤醒 worker。重新开启 sour
 只用于 runtime startup/shutdown 和注册失败回滚。
 
 RX 或 TX 的单次预算耗尽时，worker 保留已有 pending/rearm/notify 状态，并在释放 UART
-register gate 和相关锁后主动让出一次调度机会，再继续处理本轮另一方向或进入下一轮。
-这样持续串口积压仍会推进，RX 也不会跳过同轮 TX，但固定的 `owner_cpu` 不会成为无界运行
-段，source mask/rearm 的所有权保持不变。
+register gate 和相关锁后通过 runtime task facade 主动让出一次调度机会，再继续处理本轮另一
+方向或进入下一轮。这样持续串口积压仍会推进，RX 也不会跳过同轮 TX，但固定的
+`owner_cpu` 不会成为无界运行段，source mask/rearm 的所有权保持不变。worker 只运行在
+可调度 task context；yield 失败表示 runtime 所有权不变量已破坏，不能静默退回忙循环。
 
 ## SMP 与内存顺序
 
@@ -188,7 +189,7 @@ ingress；日志 backlog、覆盖或 reservation failure 不消耗 TTY 队列空
 虽然可能在同一 CPU 上交替成为 producer，但发布期间禁止迁移和本地 IRQ，所以从 ring
 角度仍是单 writer；FIQ/NMI 和 panic 不进入该路径。owner worker 是所有 ring 的唯一
 reader，并在 CPU 之间 round-robin：保证每个 CPU 内的 sequence 顺序，不承诺不同 CPU
-调用之间的全局时间顺序。IPI/`IrqNotify` 只是可合并 doorbell，不能承载 payload 或定义
+调用之间的全局时间顺序。IPI/`FixedIrqWorkerSignal` 只是可合并 doorbell，不能承载 payload 或定义
 record 顺序。
 
 每个 slot 把 generation 与以下状态一起原子发布：
@@ -207,7 +208,7 @@ ownership，复制完成后才释放，禁止 producer 与 reader 同时访问 r
 均只更新有界统计并返回，不能等待 worker、分配内存或进入 TTY。
 
 secondary CPU 在建立本核 scheduler/current task 前也可能发布启动日志。该阶段只允许把
-完整 record 发布到本 CPU ring，不能通过 `IrqNotify` 选择运行队列或唤醒固定在 owner CPU
+完整 record 发布到本 CPU ring，不能通过 `FixedIrqWorkerSignal` 选择运行队列或唤醒固定在 owner CPU
 的 worker；否则会在本核 scheduler/IPI 尚未初始化时进入跨核 wake。每 CPU 的显式
 `wake_ready` 状态只在 scheduler、IRQ 和 IPI 路径全部就绪后发布；之后的普通日志或 IRQ
 日志才发送可合并 doorbell，并同时推动此前缓存的早期 record。
@@ -280,10 +281,9 @@ sleepable lock，因为日志既可能来自 hard IRQ，也可能来自尚未执
 平台同步写更强的 drain 保证。已经进入 `Preparing` 后失败的 `FailedClosed` 后端不会走
 这条 fallback，也不会重新访问 early UART。
 
-console 不再有独立 Cargo feature。`ax-runtime` 在同时启用既有 `irq` 和 `multitask`
-能力时编译多 UART runtime、紧急端点与任务态 console；probe 后有匹配设备才接管，否则
-公共任务态 output 自动使用 HAL，input 仅在 HAL 能提供 IRQ-backed sleep 时可用。无调度器
-或无 IRQ 的最小 ArceOS 构建不会创建 owner worker，也保持原始 HAL 路径。
+console 不再有独立 Cargo feature。`ax-runtime` 始终编译多 UART runtime、紧急端点与
+任务态 console；probe 后有匹配设备才接管，否则公共 output 使用 HAL raw output，task
+input 返回 unsupported。平台 IRQ 框架始终存在，但设备没有独立硬件 IRQ 仍是合法状态。
 
 ArceOS 的 `ax-api`、`ax-posix-api` 和 `ax-std` 共享唯一 input lease；空输入通过
 `wait_readable` 睡眠，不再 `yield_now` 轮询，stdout `flush` 等待真实 UART idle。

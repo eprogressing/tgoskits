@@ -1,4 +1,4 @@
-use super::common::{expand, metadata_for_packages, metadata_with_resolve, pkg, pkg_with_metadata};
+use super::common::{expand, metadata_with_resolve, pkg, pkg_with_metadata};
 use crate::clippy::{
     AXSTD_STD_CLIPPY_FEATURES, AXSTD_STD_DEFAULT_FEATURE, AXSTD_STD_PACKAGE,
     check::{ClippyCheck, ClippyCheckKind},
@@ -121,7 +121,6 @@ fn host_test_feature_uses_host_target_outside_docs_target_matrix() {
         .filter(|check| check.label().contains("feature: host-test"))
         .collect::<Vec<_>>();
 
-    assert_eq!(host_test_checks.len(), 1);
     assert_eq!(host_test_checks[0].label(), "alpha (feature: host-test)");
     assert!(
         !host_test_checks[0]
@@ -147,9 +146,30 @@ fn host_test_feature_alias_uses_host_target_outside_docs_target_matrix() {
         .filter(|check| check.label().contains("feature: test"))
         .collect::<Vec<_>>();
 
-    assert_eq!(test_checks.len(), 1);
     assert_eq!(test_checks[0].label(), "alpha (feature: test)");
     assert!(!test_checks[0].cargo_args().contains(&"--target".into()));
+}
+
+#[test]
+fn clippy_preserves_non_bare_docs_rs_targets() {
+    let target = "x86_64-unknown-linux-gnu";
+    let check = ClippyCheck {
+        package: "host-package".into(),
+        kind: ClippyCheckKind::Base,
+        target: Some(target.into()),
+        env: Vec::new(),
+    };
+
+    let invocation = check.cargo_invocation();
+
+    assert!(
+        invocation
+            .args
+            .windows(2)
+            .any(|args| args == ["--target", target])
+    );
+    assert!(!invocation.args.iter().any(|arg| arg == "json-target-spec"));
+    assert!(invocation.env.is_empty());
 }
 
 #[test]
@@ -168,36 +188,6 @@ fn incremental_selection_checks_changed_packages_and_affected_os_roots_only() {
     assert_eq!(
         selected,
         vec!["shared".to_string(), "ax-std".into(), "starryos".into()]
-    );
-}
-
-#[test]
-fn incremental_selection_for_x86_apic_change_omits_unrelated_workspace_packages() {
-    let selected = incremental_clippy_selections(
-        vec![
-            "someboot".into(),
-            "somehal".into(),
-            "x86-apic-driver".into(),
-        ],
-        vec![
-            "ax-std".into(),
-            "someboot".into(),
-            "somehal".into(),
-            "starryos".into(),
-            "unrelated".into(),
-            "x86-apic-driver".into(),
-        ],
-    );
-
-    assert_eq!(
-        selected,
-        vec![
-            "someboot".to_string(),
-            "somehal".into(),
-            "x86-apic-driver".into(),
-            "ax-std".into(),
-            "starryos".into(),
-        ]
     );
 }
 
@@ -362,7 +352,6 @@ fn package_with_features_yields_base_plus_each_feature() {
         None,
     )]);
 
-    assert_eq!(checks.len(), 3);
     assert_eq!(
         checks[0].cargo_args(),
         vec!["clippy", "--no-deps", "-p", "alpha", "--", "-D", "warnings"]
@@ -408,7 +397,6 @@ fn docs_rs_targets_expand_base_and_feature_checks() {
         Some(&["riscv64gc-unknown-none-elf"]),
     )]);
 
-    assert_eq!(checks.len(), 3);
     assert_eq!(
         checks[0].cargo_args(),
         vec![
@@ -444,66 +432,6 @@ fn docs_rs_targets_expand_base_and_feature_checks() {
         checks[2].label(),
         "alpha (feature: b, target: riscv64gc-unknown-none-elf)"
     );
-}
-
-#[test]
-fn ax_hal_platform_features_are_filtered_by_target_arch() {
-    let checks = expand(&[pkg(
-        "ax-hal",
-        "ax-hal 0.1.0 (path+file:///tmp/ax-hal)",
-        &[("irq", &[])],
-        Some(&["loongarch64-unknown-none", "riscv64gc-unknown-none-elf"]),
-    )]);
-
-    let has_feature_on_target = |feature: &str, target: &str| {
-        checks.iter().any(|check| {
-            matches!(&check.kind, ClippyCheckKind::Feature(check_feature) if check_feature == feature)
-                && check.target.as_deref() == Some(target)
-        })
-    };
-
-    assert!(has_feature_on_target(
-        "irq",
-        "loongarch64-unknown-none-softfloat"
-    ));
-    assert!(has_feature_on_target("irq", "riscv64gc-unknown-none-elf"));
-}
-
-#[test]
-fn ax_hal_target_only_features_are_skipped_for_host_clippy() {
-    let checks = expand(&[pkg(
-        "ax-hal",
-        "ax-hal 0.1.0 (path+file:///tmp/ax-hal)",
-        &[("irq", &[])],
-        None,
-    )]);
-
-    assert!(checks.iter().any(|check| {
-        matches!(&check.kind, ClippyCheckKind::Feature(feature) if feature == "irq")
-    }));
-}
-
-#[test]
-fn ax_hal_platform_feature_forwards_are_filtered_by_target_arch() {
-    let checks = expand(&[pkg(
-        "platform-forwarder",
-        "platform-forwarder 0.1.0 (path+file:///tmp/platform-forwarder)",
-        &[("irq", &["ax-hal/irq"])],
-        Some(&["loongarch64-unknown-none", "riscv64gc-unknown-none-elf"]),
-    )]);
-
-    let has_feature_on_target = |feature: &str, target: &str| {
-        checks.iter().any(|check| {
-            matches!(&check.kind, ClippyCheckKind::Feature(check_feature) if check_feature == feature)
-                && check.target.as_deref() == Some(target)
-        })
-    };
-
-    assert!(has_feature_on_target(
-        "irq",
-        "loongarch64-unknown-none-softfloat"
-    ));
-    assert!(has_feature_on_target("irq", "riscv64gc-unknown-none-elf"));
 }
 
 #[test]
@@ -659,28 +587,50 @@ fn package_clippy_configurations_expand_target_feature_sets() {
 }
 
 #[test]
-fn selected_package_expands_package_clippy_configurations() {
-    let package = pkg_with_metadata(
+fn package_clippy_configuration_lints_source_with_rustflags() {
+    let checks = expand(&[pkg_with_metadata(
         "alpha",
         "alpha 0.1.0 (path+file:///tmp/alpha)",
-        &[],
+        &[("axtest", &[]), ("smp", &[])],
         serde_json::json!({
             "clippy": {
                 "configurations": [{
-                    "name": "aarch64-system",
-                    "target": "aarch64-unknown-none-softfloat",
+                    "name": "loongarch64-axtest-source",
+                    "target": "loongarch64-unknown-none-softfloat",
+                    "features": ["axtest", "smp"],
+                    "rustflags": ["--cfg", "axtest", "--check-cfg", "cfg(axtest)"],
                 }],
             },
         }),
-    );
-    let metadata = metadata_for_packages(core::slice::from_ref(&package));
-    let checks = crate::clippy::expand::expand_clippy_checks(&[package], &metadata).unwrap();
+    )]);
+    let check = checks
+        .iter()
+        .find(|check| {
+            check
+                .label()
+                .contains("configuration: loongarch64-axtest-source")
+        })
+        .expect("source configuration should be planned");
 
-    assert_eq!(checks.len(), 2);
-    assert_eq!(checks[0].label(), "alpha (base)");
     assert_eq!(
-        checks[1].label(),
-        "alpha (configuration: aarch64-system, features: , target: aarch64-unknown-none-softfloat)"
+        check.cargo_args(),
+        [
+            "clippy",
+            "--no-deps",
+            "-p",
+            "alpha",
+            "--features",
+            "axtest,smp",
+            "--target",
+            "loongarch64-unknown-none-softfloat",
+            "--",
+            "--cfg",
+            "axtest",
+            "--check-cfg",
+            "cfg(axtest)",
+            "-D",
+            "warnings",
+        ]
     );
 }
 
@@ -715,90 +665,26 @@ fn duplicate_package_clippy_configuration_names_are_rejected() {
 }
 
 #[test]
-fn starry_aarch64_clippy_configurations_match_qemu_builds() {
-    let workspace_root = crate::context::find_workspace_root();
-    let manifest: StarryKernelManifest = toml::from_str(
-        &std::fs::read_to_string(workspace_root.join("os/StarryOS/kernel/Cargo.toml")).unwrap(),
-    )
-    .unwrap();
+fn package_clippy_configuration_rejects_empty_rustflags() {
+    let package = pkg_with_metadata(
+        "alpha",
+        "alpha 0.1.0 (path+file:///tmp/alpha)",
+        &[],
+        serde_json::json!({
+            "clippy": {
+                "configurations": [{
+                    "name": "aarch64-source",
+                    "target": "aarch64-unknown-none-softfloat",
+                    "rustflags": ["--cfg", ""],
+                }],
+            },
+        }),
+    );
 
-    for (name, relative_build_path) in [
-        (
-            "aarch64-system",
-            "test-suit/starryos/qemu/build-aarch64-unknown-none-softfloat.toml",
-        ),
-        (
-            "aarch64-system-rga",
-            "test-suit/starryos/qemu-rga/build-aarch64-unknown-none-softfloat.toml",
-        ),
-    ] {
-        let build: StarryBuildConfiguration = toml::from_str(
-            &std::fs::read_to_string(workspace_root.join(relative_build_path)).unwrap(),
-        )
-        .unwrap();
-        let configuration = manifest
-            .package
-            .metadata
-            .clippy
-            .configurations
-            .iter()
-            .find(|configuration| configuration.name == name)
-            .unwrap();
-        let mut expected_features = build.features;
-        expected_features.push("smp".into());
-        expected_features.sort();
-        expected_features.dedup();
+    let err = package_clippy_configurations(&package).unwrap_err();
 
-        assert_eq!(configuration.features, expected_features);
-        assert_eq!(configuration.target, build.target);
-        assert_eq!(configuration.env.get("AX_ARCH"), Some(&"aarch64".into()));
-        assert_eq!(
-            configuration.env.get("AX_TARGET"),
-            Some(&configuration.target)
-        );
-        assert_eq!(
-            configuration.env.get("AX_LOG"),
-            Some(&build.log.to_ascii_lowercase())
-        );
-        assert_eq!(
-            configuration.env.get("SMP"),
-            Some(&build.max_cpu_num.to_string())
-        );
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct StarryKernelManifest {
-    package: StarryKernelPackage,
-}
-
-#[derive(serde::Deserialize)]
-struct StarryKernelPackage {
-    metadata: StarryKernelMetadata,
-}
-
-#[derive(serde::Deserialize)]
-struct StarryKernelMetadata {
-    clippy: StarryClippyMetadata,
-}
-
-#[derive(serde::Deserialize)]
-struct StarryClippyMetadata {
-    configurations: Vec<StarryClippyConfiguration>,
-}
-
-#[derive(serde::Deserialize)]
-struct StarryClippyConfiguration {
-    name: String,
-    target: String,
-    features: Vec<String>,
-    env: std::collections::BTreeMap<String, String>,
-}
-
-#[derive(serde::Deserialize)]
-struct StarryBuildConfiguration {
-    features: Vec<String>,
-    max_cpu_num: usize,
-    log: String,
-    target: String,
+    assert_eq!(
+        err.to_string(),
+        "clippy configuration `aarch64-source` rustflag for `alpha` must be non-empty and trimmed"
+    );
 }

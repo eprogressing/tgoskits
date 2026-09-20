@@ -16,12 +16,12 @@ pub use self::{
         InterfaceKind, InterfaceMatcher, Ipv4InterfaceConfig, NetworkConfig,
         RouteInfo, StaticIpConfig,
     },
-    device::{
-        ArpEntry, EthernetDeviceList, EthernetDriver, EthernetIrqAction,
-        EthernetIrqOutcome, EthernetIrqRegistrar, EthernetIrqRegistration,
-        EthernetIrqRegistrationError, NetDeviceError, NetDeviceResult,
-        NetIrqEvents, NetRxBuffer, NetTxBuffer, RdNetDriver,
-        set_ethernet_irq_registrar,
+    device::{ArpEntry, EthernetFramePort, EthernetFramePortList, NetDeviceError, NetDeviceResult},
+    queue_runtime::{
+        NetQueueStats, NetworkDeviceInput, NetworkQueueRuntime,
+        NetworkRuntimeBuilder, NetworkRuntimeError, PinnedNetIrqAction,
+        PinnedNetIrqError, PinnedNetIrqOutcome, PinnedNetIrqRegistrar,
+        PinnedNetIrqRegistration, ResolvedNetIrqSource, TxQueueDiscipline,
     },
     socket::{
         CMsgData, IpCmsg, RecvFlags, RecvOptions, SendFlags, SendOptions,
@@ -30,6 +30,7 @@ pub use self::{
     router::NetDevStats,
 };
 pub use error::{NetError, NetResult};
+pub use rd_net::{WifiLinkPolicy, WifiOperation, WifiTransaction, Wpa2Pmk};
 ```
 
 re-export 列表构成调用方可依赖的稳定表面，内部 `Service`、Router queue 与 smoltcp handle 均未公开。API 分层据此按能力和生命周期组织这些类型，而不是按内部模块目录暴露实现。
@@ -103,14 +104,18 @@ pub struct StaticIpConfig {
 - `metric` 同时影响路由选择和 DNS server 排序。
 - `default_dns_servers` 是接口级 DNS 不可用时的 fallback 来源。
 
-字段列表显示 `NetworkConfig` 只描述期望状态，真正的全局所有者尚未创建。网络初始化入口负责校验并把这些配置原子转化为接口、路由、DNS 与设备 Worker。
+字段列表显示 `NetworkConfig` 只描述期望状态，真正的全局所有者尚未创建。网络初始化入口负责校验并把这些配置原子转化为接口、路由、DNS 与已经建立好的 queue runtime。
 
 ### 2.2 网络初始化
 
-`init_network()` 是 Ethernet 网络栈的唯一全局构造入口，它把 `EthernetDeviceList` 和 `NetworkConfig` 转换为共享的 `Service`、`NetControl`、`Router` 及设备 Worker。维护初始化代码时应保持配置校验、全局单例发布和后台任务启动的先后关系，因为 socket API 在该入口返回后会立即依赖这些对象。
+`init_network()` 是协议网络栈的唯一全局构造入口。调用者先用 `NetworkRuntimeBuilder` 消费全部物理设备、固定 queue executor 与 IRQ，再把得到的 `NetworkQueueRuntime`、协议端口列表和 `NetworkConfig` 一次性交给本函数。维护初始化代码时必须保持 queue runtime 就绪、协议状态构造、全局单例发布和唯一 protocol executor 启动的先后关系，因为 socket API 在该入口返回后会立即依赖这些对象。
 
 ```rust
-pub fn init_network(net_devs: EthernetDeviceList, config: NetworkConfig);
+pub fn init_network(
+    queue_runtime: NetworkQueueRuntime,
+    frame_ports: EthernetFramePortList,
+    config: NetworkConfig,
+);
 ```
 
 调用方传入已发现的 Ethernet driver 列表和结构化配置。初始化会完成：
@@ -119,14 +124,17 @@ pub fn init_network(net_devs: EthernetDeviceList, config: NetworkConfig);
 - 为每个 Ethernet 设备分配 `InterfaceId` 和接口名。
 - 创建 `Router`、`NetControl`、smoltcp `Interface` 和全局 `SocketSet`。
 - 安装静态地址、DHCP client 状态、DNS entries 和 route rules。
-- 启动非 loopback 设备的 RX/TX worker。
-- 启动专用 net-poll worker。
+- 安装已经通过 fixed-affinity 握手并完成 IRQ rearm 的 queue runtime。
+- 在选定 CPU 启动唯一 protocol executor。
 
+`NetworkQueueRuntime` 是必选参数：物理 NIC 必须已经完成 typed IRQ source 解析、
+fixed-affinity worker 启动和初始 rearm，网络栈没有 no-IRQ 或周期轮询降级路径。
+loopback 可以作为唯一接口存在，但仍由同一个 runtime 选择并持有唯一 protocol owner。
 `init_network()` 是一次性初始化入口，重复初始化会触发全局单例保护。
 
 ### 2.3 轮询触发
 
-普通调用者通过 `request_poll()` 表达“协议状态需要继续推进”，而不直接持有 `SERVICE` 执行 smoltcp poll。这个边界把 socket 热路径与串行 `PollOwnership` 解耦，并让设备 Worker、定时器和应用线程复用同一唤醒机制。
+普通调用者通过 `request_poll()` 发布 generation，表达“协议状态需要继续推进”，而不直接持有 `SERVICE` 执行 smoltcp poll。只有固定 CPU 的 protocol executor 能消费 generation 并调用 smoltcp；socket、queue executor、协议定时器和同步 flush 都只是请求方。
 
 ```rust
 pub fn request_poll();
@@ -136,31 +144,51 @@ pub fn request_poll();
 
 ```rust
 pub fn request_poll() {
-    publish_poll_request(&NET_POLL_REQUESTED, || {
-        NET_POLL_WAKE.notify_one(true);
-    });
+    let _ = PROTOCOL_POLL.request();
 }
 ```
 
-`publish_poll_request()` 使用 `swap(false→true)` 合并重复请求：只有从未 pending 变为 pending 的第一次调用会真正 `notify_one()`。这样 socket 热路径可以频繁请求协议推进，而不会在 worker 尚未消费请求时制造重复唤醒。
+`ProtocolPollRuntime::request()` 先对 `requested` generation 做 `fetch_add`，再由
+`schedule()` 用 `swap(false→true)` 合并重复请求：只有从未 scheduled 变为 scheduled
+的第一次调用会真正唤醒固定 CPU 的 protocol executor。这样 socket 热路径可以频繁请求
+协议推进，而不会在 worker 尚未消费请求时制造重复唤醒。
 
 ### 2.4 Vsock 初始化
 
-`init_vsock()` 只负责发布 vsock 设备并启动其连接管理运行时，不参与 Ethernet `Router` 或 smoltcp `Interface` 的初始化。当前实现从传入列表末尾取一个设备，因此调用方必须把设备选择视为显式约束，而不能假定函数会注册列表中的第一个或全部设备。
+`init_vsock()` 只负责发布 vsock 设备并启动其连接管理运行时，不参与 Ethernet
+`Router` 或 smoltcp `Interface` 的初始化。设备输入必须同时携带已解析的 IRQ 和从
+driver 一次性转移的 hard-IRQ/task-rearm capability；当前拓扑只允许零个或恰好一个
+设备，多个设备会显式失败，不能再静默丢弃列表成员。
 
 ```rust
 #[cfg(feature = "vsock")]
-pub fn init_vsock(vsock_devs: VsockDeviceList);
+pub fn init_vsock(
+    devices: VsockDeviceList,
+    registrar: &dyn PinnedNetIrqRegistrar,
+    active_cpus: CpuSet,
+) -> Result<(), VsockRuntimeError>;
 
 #[cfg(feature = "vsock")]
 pub type VsockDevice = Box<dyn rdif_vsock::Interface>;
 #[cfg(feature = "vsock")]
-pub type VsockDeviceList = Vec<VsockDevice>;
+pub type VsockDeviceList = Vec<VsockDeviceInput>;
+
+pub struct VsockDeviceInput {
+    pub name: String,
+    pub device: VsockDevice,
+    pub irq: IrqId,
+    pub endpoints: VsockIrqEndpoints,
+}
 ```
 
-vsock 不进入 smoltcp `SocketSet`，也不实现 `ax-net` 内部 IP `Device` trait。它通过 `rdif_vsock::Interface` 和 vsock connection manager 进入 AF_VSOCK socket backend。
+vsock 不进入 smoltcp `SocketSet`，也不实现 `ax-net` 内部 IP `Device` trait。它通过
+`rdif_vsock::Interface` 和 vsock connection manager 进入 AF_VSOCK socket backend。
+固定 worker 复用 Ethernet runtime 选定的 protocol owner CPU；hard IRQ 只 ACK/coalesce，
+worker 在 task context 预算 drain 后执行 rearm/recheck，没有 timer fallback。
 
-`init_vsock()` 内部用 `pop()` 取传入列表的**最后一个**设备并注册，其余设备忽略；列表为空时仅记录 warning，不创建“已初始化但无设备”的独立状态位。AF_VSOCK 后续操作若没有设备，会在 `device::vsock_*()` 路径返回 `NotFound`。
+列表为空时仅记录 warning，不创建“已初始化但无设备”的独立状态位。没有注册设备时，
+AF_VSOCK 后续操作会在 `device::vsock_*()` 路径返回 `NotFound`。设备、IRQ binding、
+endpoint transfer、worker affinity 或 registration 任一步不完整都会 fail closed。
 
 ## 3. 运行时查询
 
@@ -190,7 +218,7 @@ pub fn remove_interface_ipv4(
 
 `set_interface_ipv4()` / `remove_interface_ipv4()` 是 StarryOS rtnetlink 使用的运行期控制入口。当前每个 Ethernet 接口最多保存一个 IPv4 地址：设置第二个地址返回 `AlreadyExists`，删除必须与现有地址和 prefix 完全一致。设置操作会移除该接口的 DHCP 状态、安装 connected route，但不会创建 default route 或 gateway；删除也会关闭该接口 DHCP 并移除它贡献的路由和 DHCP DNS。
 
-`NetDevStats` 按接口返回累计的 `rx/tx bytes`、`packets`、`errors` 和 `dropped`。Ethernet 的字节口径是“不含 FCS 的 L2 frame”，loopback 则按 IP packet 长度；见[多设备实现](devices.md#9-网卡统计)。
+`NetDevStats` 按接口返回累计的 `rx/tx bytes`、`packets`、`errors` 和 `dropped`。Ethernet 的字节口径是“不含 FCS 的 L2 frame”，loopback 则按 IP packet 长度；统计快照由 `net/ax-net/src/router.rs` 的 `Router::net_dev_stats()` 汇总。
 
 `InterfaceId` 是稳定接口 ID，同时作为 StarryOS/Linux ifindex 来源：
 
@@ -515,7 +543,7 @@ pub struct TcpInfo {
 | `SendBuffer` / `ReceiveBuffer` | TCP/UDP/raw/Unix stream 等具体 backend | IP socket 返回固定 buffer 预算；`GeneralOptions` 只接受 set buffer TODO，不实际调整已分配缓冲区 |
 | `SendBufferForce` | 当前未实现 | 返回 `ENOPROTOOPT` |
 | `KeepAlive` | TCP | TCP backend 同步到 smoltcp keep-alive 配置；非 TCP backend 返回不支持 |
-| `SendTimeout` / `ReceiveTimeout` | `GeneralOptions` | 被 `send_poller*` / `recv_poller*` 使用，决定阻塞等待超时 |
+| `SendTimeout` / `ReceiveTimeout` | `GeneralOptions` | 形成 `SocketWaitPolicy`；由 ArceOS/StarryOS 驱动 `poll_socket_io()` 时执行，`ax-net` 不解释用户信号或自行 park task |
 | `PassCredentials` | Unix stream/datagram/seqpacket | 接收端启用时传递发送任务的真实 credentials |
 | `ReceiveTimestamp` | Unix datagram/seqpacket | 在消息入队时记录 wall-clock timestamp，并作为 `SocketCmsg::Timestamp` 返回 |
 | `PeerCredentials` | Unix stream/datagram/seqpacket | 返回 transport 保存的 `UnixCredentials`；StarryOS 还投影稳定进程身份到调用者 PID namespace |
@@ -568,168 +596,153 @@ pub fn dns_query_timeout(name: &str, timeout: Duration) -> NetResult<Vec<IpAddr>
 
 DNS 行为列表说明解析过程复用临时 smoltcp socket 和统一轮询，不形成独立 resolver 线程。设备驱动 API 位于更低边界，只提供 packet 与 readiness 能力，不参与名称解析策略。
 
-## 7. 设备驱动 API
+## 7. 设备与 IRQ API
 
-设备驱动 API 是 low-level NIC 和 `ax-net` 之间的能力边界。驱动提供 buffer 和 IRQ 语义，协议栈不依赖具体 DMA ring 或虚拟队列实现。
-
-### 7.1 以太网驱动边界
-
-`EthernetDriver` 是 `ax-net` 与具体 NIC 实现之间的能力边界，只暴露 MAC、MTU、收发和可选 IRQ/OOB readiness。`EthernetDevice` 在这一层之外完成 ARP、Ethernet framing 和统计，因此驱动不需要了解 `Router`、socket 或控制面对象。
+物理设备边界由 `rdif-eth`/`rd-net` 定义。`NetDevice` 只能消费一次：
 
 ```rust
-pub type EthernetDeviceList = Vec<Box<dyn EthernetDriver>>;
+pub trait NetDevice: DriverGeneric + Send + 'static {
+    fn into_parts(self: Box<Self>) -> Result<NetDeviceParts, NetError>;
+}
 
-pub trait EthernetDriver: Send + Sync {
-    fn device_name(&self) -> &str;
-    fn irq_id(&self) -> Option<IrqId>;
-    fn enable_irq(&mut self);
-    fn disable_irq(&mut self);
-    fn mac_address(&self) -> [u8; 6];
-    fn alloc_tx_buffer(&mut self, size: usize) -> NetDeviceResult<Box<dyn NetTxBuffer>>;
-    fn recycle_tx_buffers(&mut self) -> NetDeviceResult;
-    fn transmit(&mut self, tx_buf: &mut dyn NetTxBuffer) -> NetDeviceResult;
-    fn receive(&mut self) -> NetDeviceResult<Box<dyn NetRxBuffer>>;
-    fn recycle_rx_buffer(&mut self, rx_buf: &mut dyn NetRxBuffer) -> NetDeviceResult;
-    fn handle_irq(&mut self) -> NetIrqEvents;
-    fn take_irq_handler(&mut self) -> Option<Box<dyn EthernetIrqHandler>>;
+pub struct NetDeviceParts {
+    pub info: NetDeviceInfo,
+    pub control: Box<dyn NetControlEndpoint>,
+    pub wifi_control: Option<Box<dyn WifiControl>>,
+    pub poll_groups: Vec<NetPollGroupParts>,
 }
 ```
 
-RX/TX buffer trait：
+每个 `NetPollGroupParts` 包含 typed group/queue ID、RX/TX queue、一个
+task-context `NetPollIrqControl` 和一个或多个 move-only
+`NetHardIrqEndpoint`。driver core 不暴露动态 queue 创建、设备级 IRQ 开关或 raw
+完整设备 handle。
+
+group 还可以携带 move-only `NetOwnerStartup`。它在 worker 已固定到 owner CPU、IRQ
+callback 已注册并 enable 后、initial refill 和队列发布前执行。驱动可以在此完成
+传输层初始化、身份确认和固件下载，复用数据面的 owner 约束；runtime 只消费
+`start / advance / cancel` 的结果，不解释具体设备协议。
+
+### 7.1 DMA 与提交错误
+
+`DmaBuffer` 不实现 `Clone`/`Copy`。RX completion 把 token move 到 protocol owner，
+消费后从 recycle ring 返回；TX 从 free ring move 到 driver，completion 再归还。
+`SubmitError` 必须携带原 buffer，因此 retry、unsupported 或 I/O error 都不能泄漏
+DMA ownership。
+
+### 7.2 Hard IRQ 与 task rearm
 
 ```rust
-pub trait NetRxBuffer: Send {
-    fn packet(&self) -> &[u8];
-    fn packet_len(&self) -> usize {
-        self.packet().len()
-    }
+pub trait NetHardIrqHandler: Send {
+    fn handle_irq(&mut self) -> NetHardIrqResult;
 }
 
-pub trait NetTxBuffer: Send {
-    fn packet(&self) -> &[u8];
-    fn packet_mut(&mut self) -> &mut [u8];
-    fn packet_len(&self) -> usize;
-}
-```
-
-`RdNetDriver` 是基于 `rd-net` 的标准适配实现。
-
-### 7.2 缓冲区错误语义
-
-`EthernetDriver` 把底层 NIC 的 DMA ring、virtqueue 或 `rd-net` queue 抽象为一次一个 packet 的 buffer ownership：
-
-```text
-RX:
-  driver.receive() -> Box<dyn NetRxBuffer>
-  EthernetDevice reads packet()
-  driver.recycle_rx_buffer(rx_buf)
-
-TX:
-  driver.alloc_tx_buffer(frame_len)
-  EthernetDevice fills packet_mut()
-  driver.transmit(tx_buf)
-  driver.recycle_tx_buffers()
-```
-
-错误类型保持小集合，便于 Router 和设备 worker 做统一策略：
-
-| 错误 | 语义 |
-| --- | --- |
-| `Again` | 暂无 RX packet、TX 暂不可用或需要稍后重试 |
-| `BadState` | 设备未处于可收发状态 |
-| `InvalidParam` | packet size 或参数非法 |
-| `Io` | 底层设备或传输错误 |
-| `NoMemory` | 驱动无法分配 buffer |
-| `Unsupported` | 设备不支持该操作 |
-
-`NetIrqEvents` 是 IRQ summary bitmask。`RX_READY`、`RX_ERROR`、`TX_DONE` 会唤醒相关 worker；`SPURIOUS` 表示没有需要网络栈处理的事件。
-
-### 7.3 通用驱动适配
-
-`RdNetDriver` 持有 `rd_net::TxQueue`、`rd_net::RxQueue` 和少量 `pending_rx` 预取缓存。它的设计边界是：
-
-- RX 预取目标为 `RX_PREFETCH_TARGET = 1`，只减少一次收包路径上的驱动交互，不形成额外无界缓存。
-- `alloc_tx_buffer()` 按请求长度分配；`transmit()` 在提交 `rd-net` 前将短帧补齐到 Ethernet 最小帧长 `ETH_ZLEN = 60`。
-- `rd_net::NetError::Retry` 映射为 `NetDeviceError::Again`，`NoMemory` / `NotSupported` 保留对应语义，link down 或其它底层错误映射为 `Io`。
-- `ax-net` 上层不依赖 `rd-net` 类型；其它 NIC driver 只要实现 `EthernetDriver` 即可接入。
-
-适配约束列表确保 `RdNetDriver` 只承担通用队列桥接，不把 ARP、Router 或控制面逻辑下沉。IRQ 注册则通过独立 capability 把平台中断动作接入同一个设备 Worker 唤醒模型。
-
-### 7.4 IRQ 注册
-
-IRQ 注册能力由 runtime 通过 `EthernetIrqRegistrar` 注入，设备初始化随后把 `take_irq_handler()` 返回的独立 handler 移交给平台 action。硬中断路径只负责确认事件并调用 `wake_net_task_irq()`，不能获取 Worker 正常收发所用的普通设备锁或直接进入协议 poll。
-
-```rust
-pub fn set_ethernet_irq_registrar(registrar: &'static dyn EthernetIrqRegistrar);
-
-pub trait EthernetIrqRegistrar: Send + Sync {
-    fn register_shared(
-        &self,
-        name: &str,
-        irq: IrqId,
-        action: EthernetIrqAction,
-    ) -> Result<Box<dyn EthernetIrqRegistration>, EthernetIrqRegistrationError>;
+pub trait NetPollIrqControl: Send {
+    fn quiesce(&mut self) -> Result<(), NetError>;
+    fn shutdown(&mut self) -> Result<(), NetError>;
+    fn rearm_and_check(&mut self) -> Result<NetRearmResult, NetError>;
 }
 ```
 
-有 IRQ 的 `RdNetDriver` 通过 `take_irq_handler()` 把独立拥有的 IRQ endpoint 移交给 `EthernetIrqAction`。因此硬 IRQ 回调不会获取正常收发所用的 driver `SpinLock`；它只确认/汇总事件并发布 readiness。返回 `EthernetIrqOutcome::Wake` 时，adapter 唤醒设备 RX worker 和 net-poll 路径。驱动未提供独立 handler 或平台未安装 registrar 时，设备退回 worker 的 10 ms 轮询兜底。
+hard endpoint 只返回 `Spurious`、`Schedule(snapshot)` 或 `ProbeDeferred`。它只做
+bounded mask/ack/status snapshot，不分配、不访问 DMA payload、不进入 protocol。
+queue owner drain 以后才调用原子 `rearm_and_check()`；若窗口中已有工作则保持 IRQ
+关闭并重新 schedule。
 
-### 7.5 动态设备注册
+teardown 只有在 callback disable/synchronize 成功后才由 owner CPU 调用
+`shutdown()`。同步失败时 callback lease 与 executor backing 一起隔离，不再并发进入
+driver；同步成功但 shutdown 失败时同样隔离完整 poll group，而不是 drop 仍可能被硬件
+引用的 token 或 descriptor。
 
-`register_device_with_config()` 将运行期发现的静态 IPv4 设备纳入现有 `Service`，并同步接口 registry、smoltcp 地址、路由规则及设备 Worker。该 API 不是第二套初始化流程；它要求全局网络服务已经建立，并通过相同控制面提交边界保持查询状态与数据面一致。
+### 7.3 Runtime builder 与 fixed affinity
 
 ```rust
-pub struct NetConfig {
+pub enum TxQueueDiscipline {
+    NoQueue,
+    Fifo { max_frames: NonZeroUsize },
+}
+
+pub struct NetworkDeviceInput {
     pub name: String,
-    pub ip: [u8; 4],
-    pub prefix_len: u8,
-    pub dhcp_server_client_ip: Option<[u8; 4]>,
-    pub dedicated_poll: bool,
+    pub device: PreparedNetDevice,
+    pub irq_sources: Vec<ResolvedNetIrqSource>,
+    pub tx_queue_discipline: TxQueueDiscipline,
 }
 
-pub fn register_device_with_config(dev: Box<dyn EthernetDriver>, config: NetConfig);
-pub fn wake_net_task_irq();
+pub trait PinnedNetIrqRegistrar: Sync {
+    fn register(
+        &self,
+        name: String,
+        irq: IrqId,
+        owner_cpu: usize,
+        action: PinnedNetIrqAction,
+    ) -> Result<Box<dyn PinnedNetIrqRegistration>, PinnedNetIrqError>;
+}
 ```
 
-`register_device_with_config()` 用于运行期加入静态 IPv4 Ethernet 设备，例如 Wi-Fi AP 模式设备。它会：
+`NetworkDeviceInput` 的构造方必须逐设备选择 discipline。`NoQueue` 不建立 protocol
+backlog；`Fifo` 的 `max_frames` 是 packet limit，存储只在第一次 busy 入队时分配。
+该接口当前按设备生效，不是 per-hardware-queue 配置。
 
-- 创建 `EthernetDevice` 或 OOB RX `EthernetDevice`。
-- 分配新的 `InterfaceId`。
-- 更新 smoltcp address list、接口 registry 和 route table。
-- 启动该设备的 RX/TX worker。
-- 可选启用内置单客户端 DHCP server。
+`NetworkRuntimeBuilder` 一次性消费候选设备，构造 shared-IRQ affinity domain，等待
+worker pin-ready，再以 fixed owner CPU 注册 disabled IRQ 并 enable。IRQ enable、
+initial refill/rearm 与 startup transaction 失败都会回滚。owner startup 的结果
+决定候选设备是否可以继续发布：
 
-`dedicated_poll = true` 时，设备 RX readiness 不走 Ethernet IRQ registrar，而由外部驱动线程调用 `wake_net_task_irq()` 唤醒 `net-poll` worker；Router 也会为这种 OOB RX 设备注册 readiness poll set，使 `{ifname}-rx` worker 重新检查设备。
+- `Ready`：执行 initial refill/rearm，准备发布队列。
+- `WaitForInterrupt`、`WaitForInterruptUntil` 或 `RetryAt`：按中断或 deadline 等待，尚未完成启动。
+- `DeviceNotPresent`：只有 `cancel()` 成功并 disable+synchronize 对应 IRQ callback 后才剔除该 group；设备没有剩余 group 时不发布接口，剩余设备继续初始化。
+- 其他错误、取消失败或 IRQ 同步失败：返回初始化错误；资源释放仍要求 IRQ 与 DMA 安全证明，不能确认时隔离。
 
-### 7.6 Wi-Fi 控制 API
+`DeviceNotPresent` 的非致命处理仅适用于 owner startup 的发布前阶段，不是运行期
+忽略设备错误的通用策略。候选登记不保证接口可用；没有运行时新增或删除物理
+NIC 的公共入口。
 
-运行期 Wi-Fi 模式切换使用单独的控制面句柄注册，不把无线 firmware 操作塞进数据面 driver 锁里：
+### 7.4 Wi-Fi 控制
 
 ```rust
-pub fn register_wifi_control(name: &str, handle: rd_net::WifiControlHandle);
-
-pub enum WifiMode<'a> {
-    Station { ssid: &'a str, password: &'a str },
-    AccessPoint {
-        ssid: &'a [u8],
-        channel: u8,
-        ip: [u8; 4],
-        prefix_len: u8,
-        dhcp_client_ip: Option<[u8; 4]>,
+pub enum WifiOperation {
+    Connect {
+        ssid: String,
+        pmk: Option<Wpa2Pmk>,
+        entropy: Option<[u8; 32]>,
     },
+    Disconnect,
+    StartOpenAccessPoint { ssid: Vec<u8>, channel: u8 },
 }
 
-pub fn reconfigure_wifi(name: &str, mode: WifiMode<'_>) -> NetResult<()>;
+pub fn WifiTransaction::connect_open(ssid: impl Into<String>) -> WifiTransaction;
+pub fn WifiTransaction::connect_wpa2_pmk(
+    ssid: impl Into<String>,
+    pmk: Wpa2Pmk,
+) -> WifiTransaction;
+pub fn WifiTransaction::connect_wpa2_pmk_with_entropy(
+    ssid: impl Into<String>,
+    pmk: Wpa2Pmk,
+    entropy: [u8; 32],
+) -> WifiTransaction;
+pub fn reconfigure_wifi(name: &str, transaction: WifiTransaction) -> NetResult<()>;
 ```
 
-`reconfigure_wifi()` 先通过 `WifiControlHandle` 执行 STA connect 或 open SoftAP，再在 `Service` 锁内更新对应接口的 IPv4/DHCP 角色。STA 模式清空旧静态地址并启用 DHCP client；AP 模式安装静态地址并可选启用内置单客户端 DHCP server。
+Wi-Fi control endpoint 随设备 parts 绑定到 queue owner。调用者只提交 owned
+transaction；executor quiesce group，在 owner CPU 访问 SDIO/MMIO，rearm 后才返回。
+transaction 成功后，唯一 protocol executor 更新 STA DHCP 或 SoftAP 静态地址/DHCP
+server。控制调用者不能直接借用 driver handle。
+
+Linux WEXT 的安全连接只接受原生 `iwreq -> iw_point -> iw_encode_ext` 的
+`SIOCSIWENCODEEXT` 布局和 `IW_ENCODE_ALG_PMK`。这是 Linux
+`wpa_supplicant` `driver_wext` 使用的 PMK-offload UAPI 子集，不是对任意 mainline
+cfg80211 WEXT backend 的兼容承诺。passphrase 到 PMK 的 PBKDF2 属于产品侧
+`ax-driver` 启动配置边界。`Wpa2Pmk` 的 `Debug` 固定脱敏，drop 时清零；不保留
+旧的 raw-passphrase pointer ABI 或 `WifiTransaction::connect(ssid, password)`
+兼容入口。
 
 ## 8. Unix 命名空间 API
 
 Unix path socket 需要外部文件系统 namespace provider：
 
 ```rust
-pub fn register_unix_namespace(ns: impl UnixNamespace + 'static);
+ax_net::unix::register_unix_namespace(ns: impl UnixNamespace + 'static);
 ```
 
 abstract Unix socket 使用 `ax-net` 内部内存 namespace；path socket 通过注册的 `UnixNamespace` 完成路径绑定和解析。
@@ -775,7 +788,7 @@ TCP/UDP 在 bind port 为 `0` 时分配临时端口。临时端口范围从 `491
 
 - 使用 `interfaces()`、`interface_by_name()`、`interface_by_id()` 和 `ipv4_config(name)` 查询接口状态。
 - socket 发送路径不要直接使用 `default_routes()` 自行选路，应交给 TCP/UDP/raw backend。
-- 设备驱动只实现 `EthernetDriver`，不要直接接触 `Router` 或 `SocketSet`。
-- 普通路径需要协议栈进度时调用 `request_poll()`；不要绕过 `PollOwnership` 直接同步 poll smoltcp。UDP 析构使用内部 `flush_egress()` 是受控例外。
+- 设备驱动实现 consumable `NetDevice::into_parts()`，不要直接接触 `Router` 或 `SocketSet`。
+- 普通路径需要协议栈进度时调用 `request_poll()`；不要绕过 generation runtime 直接同步 poll smoltcp。`flush_egress()` 也只等待唯一 protocol executor。
 
 这些使用约束共同维持公共 API 的单向依赖：调用方提交配置或操作并接收快照与结构化错误，内部所有者负责锁、队列和协议进展。新 API 应保持相同边界，而不是暴露可变全局对象。

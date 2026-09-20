@@ -20,9 +20,9 @@ use rdrive::{
     register::{FdtInfo, ProbeFdt},
 };
 use sdhci_host::{Sdhci, rdif as sdhci_rdif};
-use sdmmc_protocol::sdio::{card::SdioSdmmc, init::CardInitPreference};
+use sdmmc_protocol::sdio::{SdMmcIrqHost, init::CardInitPreference};
 
-use crate::{block::ProbeFdtBlock, mmio::iomap};
+use crate::{block::ProbeFdtBlock, mmio::iomap, sdhci_runtime::install_host_timer};
 
 crate::model_register!(
     name: "K230 SDHCI",
@@ -58,6 +58,7 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let mmio_base = iomap(base_reg.address as usize, mmio_size as usize)?;
 
     let mut host = unsafe { Sdhci::new(mmio_base) };
+    install_host_timer(&mut host);
     let dma = axklib::dma::device(dma_api::DmaDeviceInfo::new(
         dma_api::DmaDomainId::Direct,
         crate::binding_resolver::dma_coherency_from_fdt(info),
@@ -69,8 +70,8 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     })?;
 
     info!("k230-sdhci: defer protocol initialization to IRQ-driven hctx");
-    let card = SdioSdmmc::new(host);
-    let dev = sdhci_rdif::initializing_device(card, config, card_init_preference(info));
+    let dev =
+        sdhci_rdif::initializing_device(host.into_parts(), config, card_init_preference(info));
     let irq = probe.register_block(dev)?;
     info!("k230-sdhci block device registered irq={:?}", irq);
     Ok(())

@@ -128,7 +128,7 @@ impl NvmeBlockDriver {
         let source_id = self.nvme.admin_interrupt_source();
         IrqEndpoint::new(
             source_id,
-            0,
+            IrqQueueMask::none(),
             Box::new(NvmeAdminIrqHandler {
                 registers: self.nvme.register_ptr(),
                 source_id,
@@ -202,11 +202,7 @@ impl NvmeBlockDriver {
             io_ready: self.nvme.intx_io_ready(),
             intx_source: self.intx_source.clone(),
         };
-        Ok(IrqEndpoint::new(
-            source_id,
-            queue_mask.bits(),
-            Box::new(handler),
-        ))
+        Ok(IrqEndpoint::new(source_id, queue_mask, Box::new(handler)))
     }
 
     fn rearm_source(&mut self, source_id: usize) -> Result<(), BlkError> {
@@ -334,7 +330,11 @@ impl BlockController for NvmeBlockDriver {
             }
             ControllerEvent::Rearm { source_id } => {
                 self.rearm_source(source_id)?;
-                Ok(ControllerUpdate::state(ControllerState::Ready))
+                Ok(ControllerUpdate::state(if self.ready {
+                    ControllerState::Ready
+                } else {
+                    ControllerState::WaitingForIrq
+                }))
             }
             ControllerEvent::QuiesceIrqs => Ok(self.quiesce_interrupts()),
             ControllerEvent::Watchdog { .. } => self.stop_controller(),
@@ -426,3 +426,6 @@ fn device_info(name: &'static str, namespace: Namespace) -> DeviceInfo {
         ..DeviceInfo::new(namespace.lba_count as u64, namespace.lba_size)
     }
 }
+
+#[cfg(test)]
+mod tests;

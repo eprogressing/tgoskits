@@ -1,12 +1,20 @@
 extern crate alloc;
+// Link the runtime-owned synchronization provider used by DMA pool tests.
+extern crate ax_runtime as _;
 
-use alloc::{boxed::Box, string::String};
-use core::ptr::NonNull;
+use alloc::{
+    alloc::{alloc_zeroed, dealloc},
+    boxed::Box,
+};
+use core::{alloc::Layout, num::NonZeroUsize, ptr::NonNull};
 
-use dma_api::DmaError;
+use dma_api::{
+    DeviceDma, DmaAllocHandle, DmaCoherency, DmaConstraints, DmaDeviceInfo, DmaDirection,
+    DmaDomainId, DmaError, DmaMapHandle, DmaOp,
+};
 use rdif_eth::{
-    DmaBuffer, DriverGeneric, Event, IRxQueue, ITxQueue, IdList, Interface, IrqHandler, NetError,
-    QueueConfig, WifiControl, WifiLinkPolicy,
+    DmaBuffer, IRxQueue, ITxQueue, NetError, NetQueueId, QueueConfig, RxCompletion, SubmitError,
+    WifiOperation, WifiTransaction, Wpa2Pmk,
 };
 
 struct MockError;
@@ -25,179 +33,170 @@ impl core::fmt::Display for MockError {
 
 impl core::error::Error for MockError {}
 
-struct MockQueue {
-    id: usize,
-    last_bus_addr: Option<u64>,
-    completed: Option<(u64, usize)>,
-}
+struct TestDma;
 
-impl MockQueue {
-    const fn new(id: usize) -> Self {
-        Self {
-            id,
-            last_bus_addr: None,
-            completed: None,
-        }
-    }
-
-    const fn config() -> QueueConfig {
-        QueueConfig {
-            dma_mask: 0xffff_ffff,
-            align: 64,
-            buf_size: 2048,
-            ring_size: 128,
-        }
-    }
-}
-
-impl ITxQueue for MockQueue {
-    fn id(&self) -> usize {
-        self.id
-    }
-
-    fn config(&self) -> QueueConfig {
-        Self::config()
-    }
-
-    fn submit(&mut self, buffer: DmaBuffer) -> Result<(), NetError> {
-        self.last_bus_addr = Some(buffer.bus_addr);
-        self.completed = Some((buffer.bus_addr, buffer.len));
-        Ok(())
-    }
-
-    fn reclaim(&mut self) -> Option<u64> {
-        self.completed.take().map(|(bus_addr, _)| bus_addr)
-    }
-}
-
-impl IRxQueue for MockQueue {
-    fn id(&self) -> usize {
-        self.id
-    }
-
-    fn config(&self) -> QueueConfig {
-        Self::config()
-    }
-
-    fn submit(&mut self, buffer: DmaBuffer) -> Result<(), NetError> {
-        self.last_bus_addr = Some(buffer.bus_addr);
-        self.completed = Some((buffer.bus_addr, buffer.len / 2));
-        Ok(())
-    }
-
-    fn reclaim(&mut self) -> Option<(u64, usize)> {
-        self.completed.take()
-    }
-}
-
-struct MockIrqHandler;
-
-impl IrqHandler for MockIrqHandler {
-    fn handle_irq(&mut self) -> Event {
-        let mut event = Event::none();
-        event.tx_queue.insert(1);
-        event.rx_queue.insert(2);
-        event
-    }
-}
-
-struct MockNic {
-    irq_enabled: bool,
-    wifi_connects: usize,
-    wake: Option<fn()>,
-}
-
-impl MockNic {
-    const fn new() -> Self {
-        Self {
-            irq_enabled: false,
-            wifi_connects: 0,
-            wake: None,
-        }
-    }
-}
-
-impl rdif_eth::DriverGeneric for MockNic {
-    fn name(&self) -> &str {
-        "mock-eth"
-    }
-}
-
-impl Interface for MockNic {
-    fn mac_address(&self) -> [u8; 6] {
-        [2, 0, 0, 0, 0, 1]
-    }
-
-    fn create_tx_queue(&mut self) -> Option<Box<dyn ITxQueue>> {
-        Some(Box::new(MockQueue::new(1)))
-    }
-
-    fn create_rx_queue(&mut self) -> Option<Box<dyn IRxQueue>> {
-        Some(Box::new(MockQueue::new(2)))
-    }
-
-    fn enable_irq(&mut self) {
-        self.irq_enabled = true;
-    }
-
-    fn disable_irq(&mut self) {
-        self.irq_enabled = false;
-    }
-
-    fn is_irq_enabled(&self) -> bool {
-        self.irq_enabled
-    }
-
-    fn handle_irq(&mut self) -> Event {
-        MockIrqHandler.handle_irq()
-    }
-
-    fn take_irq_handler(&mut self) -> Option<rdif_eth::BIrqHandler> {
-        Some(Box::new(MockIrqHandler))
-    }
-
-    fn wifi_control(&mut self) -> Option<&mut dyn WifiControl> {
-        Some(self)
-    }
-}
-
-impl WifiControl for MockNic {
-    fn connect(&mut self, ssid: &str, password: &str) -> Result<(), NetError> {
-        if ssid != "ssid" || password != "pass" {
-            return Err(NetError::NotSupported);
-        }
-        self.wifi_connects += 1;
-        Ok(())
-    }
-
-    fn disconnect(&mut self) -> Result<(), NetError> {
-        Ok(())
-    }
-
-    fn start_ap_open(&mut self, ssid: &[u8], channel: u8) -> Result<(), NetError> {
-        if ssid != b"ap" || channel != 6 {
-            return Err(NetError::NotSupported);
-        }
-        Ok(())
-    }
-
-    fn set_rx_wake(&mut self, wake: fn()) {
-        self.wake = Some(wake);
-    }
-
-    fn link_policy(&self) -> Option<WifiLinkPolicy> {
-        Some(WifiLinkPolicy {
-            ip: [192, 168, 7, 1],
-            prefix_len: 24,
-            dhcp_server_client_ip: Some([192, 168, 7, 2]),
+impl TestDma {
+    unsafe fn allocate(layout: Layout) -> Option<DmaAllocHandle> {
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
+        Some(unsafe {
+            DmaAllocHandle::new(ptr, ptr, (ptr.as_ptr() as usize as u64).into(), layout)
         })
     }
 }
 
-fn wake_marker() {}
+impl DmaOp for TestDma {
+    fn page_size(&self) -> usize {
+        4096
+    }
+
+    unsafe fn alloc_contiguous(
+        &self,
+        _constraints: DmaConstraints,
+        layout: Layout,
+    ) -> Option<DmaAllocHandle> {
+        unsafe { Self::allocate(layout) }
+    }
+
+    unsafe fn dealloc_contiguous(&self, handle: DmaAllocHandle) {
+        unsafe { dealloc(handle.as_ptr().as_ptr(), handle.layout()) };
+    }
+
+    unsafe fn alloc_coherent(
+        &self,
+        _constraints: DmaConstraints,
+        layout: Layout,
+    ) -> Option<DmaAllocHandle> {
+        unsafe { Self::allocate(layout) }
+    }
+
+    unsafe fn dealloc_coherent(&self, handle: DmaAllocHandle) -> Result<(), DmaError> {
+        unsafe { dealloc(handle.as_ptr().as_ptr(), handle.layout()) };
+        Ok(())
+    }
+
+    unsafe fn map_streaming(
+        &self,
+        _constraints: DmaConstraints,
+        addr: NonNull<u8>,
+        size: NonZeroUsize,
+        _direction: DmaDirection,
+    ) -> Result<DmaMapHandle, DmaError> {
+        let layout = Layout::from_size_align(size.get(), 1)?;
+        Ok(
+            unsafe {
+                DmaMapHandle::new(addr, (addr.as_ptr() as usize as u64).into(), layout, None)
+            },
+        )
+    }
+
+    unsafe fn unmap_streaming(&self, _handle: DmaMapHandle) {}
+}
+
+static TEST_DMA: TestDma = TestDma;
+
+fn dma_buffer(len: usize) -> DmaBuffer {
+    let dev = DeviceDma::new(
+        DmaDeviceInfo::new(
+            DmaDomainId::Direct,
+            DmaCoherency::Coherent,
+            DmaConstraints::new(u64::MAX),
+        ),
+        &TEST_DMA,
+    );
+    let pool = dev.contiguous_buffer_pool(
+        Layout::from_size_align(256, 64).unwrap(),
+        DmaDirection::Bidirectional,
+        1,
+    );
+    match DmaBuffer::new(pool.alloc().unwrap(), len) {
+        Ok(buffer) => buffer,
+        Err(_) => panic!("test DMA token length must fit its allocation"),
+    }
+}
+
+struct MockTxQueue {
+    completed: Option<DmaBuffer>,
+    reject_next: bool,
+}
+
+impl MockTxQueue {
+    const fn new() -> Self {
+        Self {
+            completed: None,
+            reject_next: false,
+        }
+    }
+}
+
+impl ITxQueue for MockTxQueue {
+    fn id(&self) -> NetQueueId {
+        NetQueueId::new(1)
+    }
+
+    fn config(&self) -> QueueConfig {
+        queue_config()
+    }
+
+    fn submit(&mut self, buffer: DmaBuffer) -> Result<(), SubmitError> {
+        if core::mem::take(&mut self.reject_next) {
+            return Err(SubmitError::new(buffer, NetError::Retry));
+        }
+        self.completed = Some(buffer);
+        Ok(())
+    }
+
+    fn reclaim(&mut self) -> Option<DmaBuffer> {
+        self.completed.take()
+    }
+}
+
+struct MockRxQueue {
+    completed: Option<DmaBuffer>,
+}
+
+impl MockRxQueue {
+    const fn new() -> Self {
+        Self { completed: None }
+    }
+}
+
+impl IRxQueue for MockRxQueue {
+    fn id(&self) -> NetQueueId {
+        NetQueueId::new(2)
+    }
+
+    fn config(&self) -> QueueConfig {
+        queue_config()
+    }
+
+    fn submit(&mut self, buffer: DmaBuffer) -> Result<(), SubmitError> {
+        self.completed = Some(buffer);
+        Ok(())
+    }
+
+    fn reclaim(&mut self) -> Option<RxCompletion> {
+        self.completed.take().map(|buffer| RxCompletion {
+            packet_len: buffer.len() / 2,
+            buffer,
+        })
+    }
+}
+
+const fn queue_config() -> QueueConfig {
+    QueueConfig {
+        dma_mask: u64::MAX,
+        align: 64,
+        buf_size: 2048,
+        ring_size: 128,
+    }
+}
 
 #[test]
-fn rdif_eth_error_mapping_and_plain_config_rules_hold() {
+fn rdif_eth_errors_map_to_io_kinds() {
+    assert!(matches!(
+        rdif_eth::io::ErrorKind::from(NetError::DeviceNotPresent),
+        rdif_eth::io::ErrorKind::NotAvailable
+    ));
     assert!(matches!(
         rdif_eth::io::ErrorKind::from(NetError::NotSupported),
         rdif_eth::io::ErrorKind::Unsupported
@@ -218,7 +217,6 @@ fn rdif_eth_error_mapping_and_plain_config_rules_hold() {
         rdif_eth::io::ErrorKind::from(NetError::Other(Box::new(MockError))),
         rdif_eth::io::ErrorKind::Other(_)
     ));
-
     assert!(matches!(
         NetError::from(DmaError::NoMemory),
         NetError::NoMemory
@@ -227,90 +225,58 @@ fn rdif_eth_error_mapping_and_plain_config_rules_hold() {
         NetError::from(DmaError::ZeroSizedBuffer),
         NetError::Other(_)
     ));
-
-    let config = QueueConfig {
-        dma_mask: 0xff,
-        align: 16,
-        buf_size: 1500,
-        ring_size: 32,
-    };
-    assert_eq!(config.align, 16);
-    assert_eq!(config.buf_size, 1500);
 }
 
 #[test]
-fn rdif_eth_id_lists_and_events_track_queue_bits() {
-    let mut ids = IdList::none();
-    assert!(!ids.contains(4));
-    ids.insert(4);
-    ids.insert(7);
-    assert!(ids.contains(4));
-    assert_eq!(
-        ids.iter().collect::<alloc::vec::Vec<_>>(),
-        alloc::vec![4, 7]
-    );
-    ids.remove(4);
-    assert_eq!(ids.iter().collect::<alloc::vec::Vec<_>>(), alloc::vec![7]);
+fn submit_failure_and_reclaim_preserve_unique_dma_token() {
+    let mut tx = MockTxQueue::new();
+    tx.reject_next = true;
+    let buffer = dma_buffer(128);
+    let bus_addr = buffer.bus_addr();
+    let error = tx.submit(buffer).unwrap_err();
+    assert!(matches!(error.error(), NetError::Retry));
+    let buffer = error.into_buffer();
+    assert_eq!(buffer.bus_addr(), bus_addr);
+    tx.submit(buffer).unwrap();
+    let reclaimed = tx.reclaim().unwrap();
+    assert_eq!(reclaimed.bus_addr(), bus_addr);
 
-    let event = Event {
-        tx_queue: ids,
-        rx_queue: IdList::none(),
-    };
-    assert!(event.tx_queue.contains(7));
-    assert!(!event.rx_queue.contains(7));
+    let mut rx = MockRxQueue::new();
+    rx.submit(reclaimed).unwrap();
+    let completion = rx.reclaim().unwrap();
+    assert_eq!(completion.buffer.bus_addr(), bus_addr);
+    assert_eq!(completion.packet_len, 64);
 }
 
 #[test]
-fn rdif_eth_queues_reclaim_submitted_dma_buffers() {
-    let mut byte = 0u8;
-    let buffer = DmaBuffer {
-        virt: NonNull::from(&mut byte),
-        bus_addr: 0x1000,
-        len: 128,
-    };
+fn wifi_transaction_only_fills_missing_secured_entropy() {
+    let mut ordinary = WifiTransaction::connect_wpa2_pmk("ssid", Wpa2Pmk::new([1; 32]));
+    assert!(ordinary.needs_connect_entropy());
+    ordinary.provide_connect_entropy([7; 32]);
+    assert!(!ordinary.needs_connect_entropy());
+    assert!(matches!(
+        ordinary.operation(),
+        WifiOperation::Connect {
+            entropy: Some(value),
+            ..
+        } if *value == [7; 32]
+    ));
 
-    let mut tx = MockQueue::new(1);
-    assert_eq!(ITxQueue::id(&tx), 1);
-    assert_eq!(ITxQueue::config(&tx).ring_size, 128);
-    ITxQueue::submit(&mut tx, buffer).unwrap();
-    assert_eq!(ITxQueue::reclaim(&mut tx), Some(0x1000));
-    assert_eq!(ITxQueue::reclaim(&mut tx), None);
+    let mut explicit =
+        WifiTransaction::connect_wpa2_pmk_with_entropy("ssid", Wpa2Pmk::new([1; 32]), [3; 32]);
+    explicit.provide_connect_entropy([9; 32]);
+    assert!(matches!(
+        explicit.operation(),
+        WifiOperation::Connect {
+            entropy: Some(value),
+            ..
+        } if *value == [3; 32]
+    ));
 
-    let mut rx = MockQueue::new(2);
-    IRxQueue::submit(&mut rx, buffer).unwrap();
-    assert_eq!(IRxQueue::reclaim(&mut rx), Some((0x1000, 64)));
-    assert_eq!(IRxQueue::reclaim(&mut rx), None);
-}
-
-#[test]
-fn rdif_eth_interface_and_wifi_control_delegate_expected_paths() {
-    let mut nic = MockNic::new();
-    assert_eq!(nic.name(), "mock-eth");
-    assert_eq!(nic.mac_address(), [2, 0, 0, 0, 0, 1]);
-    assert!(!nic.is_irq_enabled());
-    nic.enable_irq();
-    assert!(nic.is_irq_enabled());
-    nic.disable_irq();
-    assert!(!nic.is_irq_enabled());
-
-    let mut handler = nic.take_irq_handler().unwrap();
-    let event = handler.handle_irq();
-    assert!(event.tx_queue.contains(1));
-    assert!(event.rx_queue.contains(2));
-
-    let tx = nic.create_tx_queue().unwrap();
-    assert_eq!(tx.id(), 1);
-    let rx = nic.create_rx_queue().unwrap();
-    assert_eq!(rx.id(), 2);
-
-    let wifi = nic.wifi_control().unwrap();
-    wifi.connect("ssid", "pass").unwrap();
-    wifi.start_ap_open(b"ap", 6).unwrap();
-    wifi.set_rx_wake(wake_marker);
-    let policy = wifi.link_policy().unwrap();
-    assert_eq!(policy.ip, [192, 168, 7, 1]);
-    assert_eq!(policy.prefix_len, 24);
-    assert_eq!(policy.dhcp_server_client_ip, Some([192, 168, 7, 2]));
-
-    let _name = String::from("keeps alloc linked");
+    let mut open = WifiTransaction::connect_open("ssid");
+    open.provide_connect_entropy([5; 32]);
+    assert!(matches!(
+        open.operation(),
+        WifiOperation::Connect { entropy: None, .. }
+    ));
 }

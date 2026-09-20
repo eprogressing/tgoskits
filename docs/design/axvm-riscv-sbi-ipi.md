@@ -109,6 +109,41 @@ guest target 公开 F/D 扩展，因此 HS-level `sstatus.FS` 的 reset 值为 `
 host/guest status 交换边界被污染；guest 内稍后出现浮点 illegal instruction，则需要检查
 guest ISA 与 reset FS 状态是否一致。两类问题都不能通过复制当前 host CSR 位来规避。
 
+物理 `sie` source mask 属于 host IRQ runtime，不属于 vCPU world switch。`RiscvVcpu::run()`
+只允许暂时清除全局 `sstatus.SIE`，并在 `_run_guest` 返回后恢复入口时的全局开关状态；它
+不得按 guest entry/exit 设置或清除 `sie.SSIE`、`sie.STIE`、`sie.SEIE`。guest 的虚拟中断
+使能和 pending 状态分别由 `vsie`、`hie`、`hvip` 拥有。Linux v7.1 KVM 同样只通过
+`arch/riscv/include/asm/irqflags.h` 的 `local_irq_disable()` 管理全局 `sstatus.SIE`；
+`arch/riscv/include/asm/kvm_host.h` 的 `kvm_cpu_context` 与
+`arch/riscv/kvm/vcpu_switch.S` 的 `__kvm_riscv_switch_to` 都不保存或改写物理
+`sie`/`sip`。
+
+违反该边界会形成确定的宿主丢唤醒：调度请求 generation 已发布、物理 IPI edge 已 armed、
+`sip.SSIP` 已 pending，但空闲核的 `sie.SSIE == 0`，因此 WFI 永远不会返回。这里不能通过
+重复响铃或放宽 scheduler 测试修补；必须保留 host IRQ runtime 建立的 source mask。
+
+`smp-ipi` guest 只验证 vCPU/SBI IPI，不得继承 host 正在使用的 PCI/NVMe root。该 VM
+配置显式禁用 `/soc/pci@30000000`，guest 继续通过虚拟 `virtio-blk` 的 `/dev/vda` 挂载
+rootfs；generated FDT 的 exclusion 必须覆盖默认 root passthrough，不能依赖 Linux
+`initcall_blacklist` 形成兼容层。
+
+## Sstc timer 所有权
+
+启用 `sstc` 时，`riscv_vcpu` 在 vCPU bind 阶段保存当前 hart 的完整 `henvcfg`，只为
+guest 执行窗口设置 `henvcfg.STCE`，并通过回读拒绝不支持该位的 hart。unbind 先保存并
+禁用 vCPU 自有的 `vstimecmp`，再恢复原始 host `henvcfg`。重复 bind/unbind 在触碰 live
+CSR 前返回 `BadState`，避免错误上下文覆盖 host 配置。
+
+Guest SBI timer 和 trapped `stimecmp` 写入只更新 vCPU 保存的 compare 以及当前绑定的
+`vstimecmp`；它们不调用 host SBI timer，也不修改物理 `sie.STIE`。因此 supervisor timer
+trap 始终作为 host external interrupt 返回，由 host IRQ/runtime 的 clockevent owner 处理，
+不会被转换为 guest VSTIP。未启用 `sstc` 时 timer programming 返回 `Unsupported`；未来若
+支持软件模拟，必须通过独立 runtime timer capability 注入，而不能借用 scheduler 的物理
+comparator。
+
+该边界通过 `riscv_vcpu` 的跨架构测试覆盖保存状态，通过 Axvisor RISC-V smoke 在真实
+H/Sstc 环境验证 guest timer 工作，并确认 host 调度器仍能收到 timer interrupt。
+
 ## 验证与回滚
 
 回归只保留 `linux-smp3-ipi.toml`，删除不再提供额外覆盖的 RISC-V QEMU 单核配置。三核
@@ -126,6 +161,17 @@ cargo xtask cross-test --arch riscv64 \
   --package riscv_vcpu --lib \
   setup_constructs_guest_status_without_accessing_host_csrs
 ```
+
+vCPU run 的 host interrupt source 所有权使用独立契约回归：
+
+```bash
+cargo xtask cross-test --arch riscv64 \
+  --package riscv_vcpu --lib \
+  vcpu_run_does_not_overwrite_host_interrupt_source_mask
+```
+
+该回归在旧实现上稳定失败；修复后还必须重复运行真实 Axvisor `smp-ipi` QEMU 用例，确认
+Linux guest 的三核启动、SBI IPI 与非零 IPI 计数同时成立。
 
 `riscv_vcpu` 用例验证 legacy 与 SBI v0.2 completion 对 A0/A1 的不同写回；AxVM
 RISC-V router 用例验证广播、零 mask、目标顺序、hart ID 溢出、未映射 hart、重复
